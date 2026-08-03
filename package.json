@@ -1,0 +1,14 @@
+{
+  "name": "proposal-design-planner",
+  "version": "2.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.js",
+    "dev": "npm run build && wrangler pages dev dist --compatibility-date=2026-07-29 --d1=DB",
+    "deploy": "npm run build && wrangler pages deploy dist"
+  },
+  "devDependencies": {
+    "wrangler": "latest"
+  }
+}

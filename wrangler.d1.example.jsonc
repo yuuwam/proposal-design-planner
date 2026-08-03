@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "proposal-design-planner",
+  "compatibility_date": "2026-07-29",
+  "pages_build_output_dir": "dist",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "proposal-design-planner-db",
+      "database_id": "这里替换成你的真实 D1 Database ID"
+    }
+  ]
+}
