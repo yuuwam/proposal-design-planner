@@ -2,5 +2,12 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "proposal-design-planner",
   "compatibility_date": "2026-07-29",
-  "pages_build_output_dir": "dist"
+  "pages_build_output_dir": "dist",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "proposal-design-planner-db",
+      "database_id": "3748deaf-1873-4eeb-ab9c-ab4d7a76328b"
+    }
+  ]
 }
