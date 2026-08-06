@@ -7,7 +7,7 @@
     {
       "binding": "DB",
       "database_name": "proposal-design-planner-db",
-      "database_id": "请替换成你的真实 D1 Database ID"
+      "database_id": "这里替换成你的 D1 Database ID"
     }
   ],
   "durable_objects": {

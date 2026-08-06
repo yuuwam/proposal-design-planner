@@ -1,11 +1,11 @@
 {
-  "name": "proposal-design-planner",
-  "version": "2.1.0",
+  "name": "proposal-design-planner-realtime",
+  "version": "3.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "node scripts/build.js",
-    "dev": "npm run build && wrangler pages dev dist --compatibility-date=2026-07-29 --d1=DB",
+    "dev": "npm run build && wrangler pages dev dist --compatibility-date=2026-07-29",
     "deploy": "npm run build && wrangler pages deploy dist"
   },
   "devDependencies": {

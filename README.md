@@ -1,45 +1,37 @@
-# Proposal Design Planner｜Cloudflare 免费版 D1 同步版（无需 R2）
+# Proposal Design Planner｜项目级实时协作版（方案 A）
 
-这是一个中性命名版本，避免使用任何平台品牌名称。适合重新部署为内部产品视觉策划工具。
+这是中性命名的 Cloudflare 免费版部署包，已从“多人同步”升级为“项目级实时协作”。
 
-## 当前版本特点
+## 当前版本能力
 
-- 中性项目名：`proposal-design-planner`
-- 中性数据库名：`proposal-design-planner-db`
-- 登录 / 注册 / 团队码协作
-- 多人同步与长期保存
-- 仅使用 Cloudflare D1，不使用 R2，不需要绑定银行卡
-- 图片压缩后保存到 D1 的 `images` 表
-- PBKDF2 迭代次数已调整为 100000，兼容 Cloudflare Pages Functions
-- `/api/me` 未登录时正常返回 401 JSON，不会再触发 1101
+- 登录 / 注册 / 团队码协作。
+- 不同团队项目完全隔离。
+- 同一团队成员打开同一个项目后，会进入同一个实时协作房间。
+- A 修改文案、尺寸、场景、提示词、项目名称等内容，B 页面无需刷新即可收到更新。
+- 页面显示实时协作状态和在线人数。
+- 简单编辑锁：当别人正在编辑某个输入框时，当前页面会标记该输入框，避免两个人同时改同一个字段。
+- 项目最终数据仍保存到 Cloudflare D1，适合长期保存。
+- 图片继续压缩到 1MB 内并保存到 D1，不需要 R2，不需要绑定银行卡。
 
-## 建议重新部署名称
+## 使用的 Cloudflare 资源
 
-GitHub 仓库名建议：
-
-```text
-proposal-design-planner
-```
-
-Cloudflare Pages 项目名建议：
+需要：
 
 ```text
-proposal-design-planner
+Cloudflare Pages
+Cloudflare D1
+Cloudflare Durable Objects
 ```
 
-D1 数据库名建议：
+不需要：
 
 ```text
-proposal-design-planner-db
+R2
+银行卡
+付费版 Cloudflare
 ```
 
-网站标题：
-
-```text
-Proposal Design Planner
-```
-
-页面说明已经改为“电商主图 / 详情页策划管理”，不再出现任何平台品牌名称。
+> Durable Objects 用来做“每个项目一个实时房间”；D1 用来保存最终项目数据、账号、团队和图片。
 
 ## Cloudflare Pages 构建设置
 
@@ -50,33 +42,57 @@ Build output directory: dist
 Root directory: /
 ```
 
-## 需要创建的 Cloudflare 资源
+## 初始化 D1
 
-只需要创建一个 D1 数据库：
+新建 D1 数据库：
 
 ```text
 proposal-design-planner-db
 ```
 
-然后给 Pages 项目添加 D1 绑定：
+进入 D1 Console，复制 `schema.sql` 的全部内容执行一次。
 
-```text
-Binding type: D1 database
-Variable name: DB
-Database: proposal-design-planner-db
+执行后用：
+
+```sql
+/tables
 ```
 
-不要创建 R2，不要添加 `IMAGES` 绑定。
-
-## 如果 Cloudflare 提示绑定由 wrangler.jsonc 管理
-
-如果 Cloudflare 的 Bindings 页面提示：
+应看到：
 
 ```text
-Bindings are being managed through wrangler.toml / wrangler.jsonc
+users
+workspaces
+workspace_users
+sessions
+planner_states
+images
 ```
 
-请打开 GitHub 仓库里的 `wrangler.jsonc`，加入你的真实 D1 Database ID：
+## 重要：配置 wrangler.jsonc
+
+因为实时协作需要 Durable Objects，建议直接通过 `wrangler.jsonc` 管理绑定。
+
+打开 D1 数据库的 Overview / Settings，复制真实的 Database ID，然后打开 GitHub 仓库里的 `wrangler.jsonc`，把这一行：
+
+```jsonc
+"database_id": "请替换成你的真实 D1 Database ID"
+```
+
+替换成真实 ID，例如：
+
+```jsonc
+"database_id": "12345678-abcd-1234-abcd-123456789000"
+```
+
+不要改 `binding` 名称。必须保持：
+
+```text
+DB
+PROJECT_ROOM
+```
+
+## wrangler.jsonc 应包含
 
 ```jsonc
 {
@@ -88,54 +104,77 @@ Bindings are being managed through wrangler.toml / wrangler.jsonc
     {
       "binding": "DB",
       "database_name": "proposal-design-planner-db",
-      "database_id": "这里替换成你的真实 D1 Database ID"
+      "database_id": "这里替换成你的 D1 Database ID"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PROJECT_ROOM",
+        "class_name": "ProjectRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1_project_room",
+      "new_sqlite_classes": ["ProjectRoom"]
     }
   ]
 }
 ```
 
-如果可以在 Cloudflare 网页中直接添加绑定，也可以保持当前 `wrangler.jsonc` 不变，直接在网页里添加 `DB` 绑定。
-
-## 初始化数据库
-
-进入 D1 数据库的 Console，把 `schema.sql` 的全部内容复制进去执行一次。
-
-如果你之前已经执行过旧版 schema，可以再执行：
-
-```sql
-ALTER TABLE images ADD COLUMN data_url TEXT;
-```
-
-如果提示 `duplicate column name: data_url`，说明已经加过，可以忽略。
-
 ## 测试接口
 
-部署成功后先打开：
+部署成功后打开：
 
 ```text
 https://你的项目.pages.dev/api/health
 ```
 
-正常应该看到：
+正常应显示：
 
 ```json
 {"ok":true,"service":"proposal-design-planner-api","db":true}
 ```
 
-再打开：
+未登录状态打开：
 
 ```text
 https://你的项目.pages.dev/api/me
 ```
 
-未登录时正常应该看到：
+应显示：
 
 ```json
 {"message":"请先登录"}
 ```
 
-## 重要说明
+## 实时协作测试
 
-这个版本是“多人同步”，不是实时多人同屏编辑。一个人修改后会自动保存到云端，另一个人刷新或重新进入后可以看到最新内容。
+1. A 用户注册，不填团队码，创建新团队。
+2. A 用户进入系统后复制顶部团队码。
+3. B 用户注册时填写 A 的团队码。
+4. A 和 B 打开同一个项目。
+5. A 修改文案、尺寸、提示词。
+6. B 的页面无需刷新，会自动更新。
+7. 如果 A 正在编辑某个输入框，B 端同一字段会出现锁定提示。
 
-由于图片存储在 D1 中，适合小团队、轻量项目使用；如果后期图片数量很多，建议再升级到 R2 或其他对象存储。
+## 注意事项
+
+这个版本是“项目级实时协作”，不是完整飞书 / 腾讯文档级 CRDT 文档协同。
+
+适合：
+
+- 小团队同时整理同一个策划项目。
+- 一个项目多人分工编辑不同板块。
+- 别人修改后当前页面自动更新。
+- 有简单编辑锁，减少互相覆盖。
+
+暂不支持：
+
+- 两个人同时在同一个文本框里逐字合并输入。
+- 离线编辑后自动合并。
+- 完整版本历史与冲突恢复。
+
+如果后期需要完全接近飞书 / 腾讯文档，需要继续升级到字段级版本历史或 CRDT / Yjs 协同模型。

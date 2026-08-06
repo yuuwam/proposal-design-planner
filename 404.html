@@ -156,6 +156,12 @@
     textarea.prompt{min-height:205px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;font-size:12px;line-height:1.65;background:#11151c;color:#e8edf7;border-color:#252c38}
     textarea.prompt:focus{background:#11151c;color:#fff;border-color:#f0ad4c}
     .sync-note{font-size:10px;color:#9ca6b7;font-weight:500}
+
+    .realtime-badge{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 9px;background:#ecfdf3;border:1px solid #bbf7d0;color:#166534;font-size:12px;font-weight:700}
+    .realtime-badge.warn{background:#fff7ed;border-color:#fed7aa;color:#9a3412}.realtime-badge.off{background:#f1f5f9;border-color:#d8e0ea;color:#64748b}
+    .realtime-dot{width:7px;height:7px;border-radius:999px;background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.16)}.realtime-badge.warn .realtime-dot{background:#f59e0b}.realtime-badge.off .realtime-dot{background:#94a3b8;box-shadow:none}
+    .presence-list{display:flex;align-items:center;gap:5px;flex-wrap:wrap}.presence-avatar{width:24px;height:24px;border-radius:999px;background:#171b24;color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:900;border:2px solid #fff;box-shadow:0 3px 9px rgba(0,0,0,.12)}
+    .remote-locked{background:#fff8e8!important;border-color:#f4b44f!important;box-shadow:0 0 0 3px rgba(245,158,11,.11)!important}.remote-locked::placeholder{color:#9a6700!important}
     .prompt-tools{display:flex;justify-content:flex-end;gap:8px;margin-top:8px;flex-wrap:wrap}
     .prompt-list{display:flex;flex-direction:column;gap:12px}
     .prompt-item{border:1px solid #dfe4ec;border-radius:15px;background:#f7f9fc;padding:10px}
@@ -321,6 +327,17 @@
   let cloudUser = null;
   let cloudWorkspace = null;
   let cloudApiReady = false;
+  let cloudApiError = "";
+  let realtimeSocket = null;
+  let realtimeProjectId = '';
+  let realtimeClientId = uid();
+  let realtimeConnected = false;
+  let realtimeUsers = [];
+  let realtimeLocks = {};
+  let realtimeReconnectTimer = null;
+  let realtimeBroadcastTimer = null;
+  let realtimeSuppress = false;
+  let realtimeLastRemoteAt = 0;
 
   const $ = (s,r=document) => r.querySelector(s);
   const $$ = (s,r=document) => Array.from(r.querySelectorAll(s));
@@ -347,12 +364,109 @@
     return `<div class="cloud-badge ${theme==='light'?'light':''}" title="${esc(invite)}"><span>云端同步</span><strong>${esc(name)}</strong><span>${invite}</span><button data-action="logout-cloud">退出</button></div>`;
   }
   async function checkCloudSession(){
-    try{const data=await apiFetch('/api/me');cloudUser=data.user;cloudWorkspace=data.workspace;cloudApiReady=true;return true}
-    catch(e){cloudUser=null;cloudWorkspace=null;cloudApiReady=e.status===401;return false}
+    try{const data=await apiFetch('/api/me');cloudUser=data.user;cloudWorkspace=data.workspace;cloudApiReady=true;cloudApiError='';return true}
+    catch(e){cloudUser=null;cloudWorkspace=null;cloudApiReady=e.status===401;cloudApiError=e.status===401?'':(e.message||'云端接口未连接，请检查 Pages Functions 和 DB 绑定');return false}
   }
   async function uploadImageToCloud(dataUrl,name){
     if(!cloudUser||!cloudApiReady)return null;
     return apiFetch('/api/images',{method:'POST',body:{dataUrl,name}});
+  }
+
+
+  function realtimeBadgeHtml(){
+    const cls=realtimeConnected?'':'warn';
+    const text=realtimeConnected?'实时协作已连接':'实时协作连接中';
+    const count=realtimeUsers.length||1;
+    const avatars=realtimeUsers.slice(0,5).map(u=>`<span class="presence-avatar" title="${esc(u.userName||u.userEmail||'成员')}">${esc((u.userName||u.userEmail||'成').slice(0,1).toUpperCase())}</span>`).join('');
+    return `<span class="realtime-badge ${cls}" id="realtimeStatus"><span class="realtime-dot"></span>${text} · ${count}人在线</span><span class="presence-list" id="presenceList">${avatars}</span>`;
+  }
+  function updateRealtimeBadge(){
+    const status=$('#realtimeStatus'),presence=$('#presenceList');
+    if(status){
+      status.className=`realtime-badge ${realtimeConnected?'':'warn'}`;
+      status.innerHTML=`<span class="realtime-dot"></span>${realtimeConnected?'实时协作已连接':'实时协作连接中'} · ${(realtimeUsers.length||1)}人在线`;
+    }
+    if(presence){presence.innerHTML=realtimeUsers.slice(0,5).map(u=>`<span class="presence-avatar" title="${esc(u.userName||u.userEmail||'成员')}">${esc((u.userName||u.userEmail||'成').slice(0,1).toUpperCase())}</span>`).join('')}
+    applyRealtimeLocks();
+  }
+  function connectRealtimeForCurrentProject(){
+    const p=getProject();
+    if(!cloudUser||!cloudApiReady||state.view!=='workspace'||!p){disconnectRealtime(false);return}
+    if(realtimeSocket&&realtimeProjectId===p.id&&(realtimeSocket.readyState===WebSocket.OPEN||realtimeSocket.readyState===WebSocket.CONNECTING))return;
+    disconnectRealtime(false);
+    realtimeProjectId=p.id;
+    realtimeClientId=realtimeClientId||uid();
+    const proto=location.protocol==='https:'?'wss':'ws';
+    const wsUrl=`${proto}://${location.host}/api/realtime?projectId=${encodeURIComponent(p.id)}&clientId=${encodeURIComponent(realtimeClientId)}`;
+    try{realtimeSocket=new WebSocket(wsUrl)}catch(e){console.warn('实时协作连接失败',e);return}
+    realtimeSocket.onopen=()=>{realtimeConnected=true;updateRealtimeBadge();sendRealtime({type:'ping'})};
+    realtimeSocket.onmessage=e=>handleRealtimeMessage(e.data);
+    realtimeSocket.onclose=()=>{realtimeConnected=false;realtimeUsers=[];realtimeLocks={};updateRealtimeBadge();if(state?.view==='workspace'&&cloudUser){clearTimeout(realtimeReconnectTimer);realtimeReconnectTimer=setTimeout(connectRealtimeForCurrentProject,1800)}};
+    realtimeSocket.onerror=()=>{realtimeConnected=false;updateRealtimeBadge()};
+  }
+  function disconnectRealtime(clear=true){
+    clearTimeout(realtimeReconnectTimer);clearTimeout(realtimeBroadcastTimer);
+    if(realtimeSocket){try{realtimeSocket.close()}catch(e){}}
+    realtimeSocket=null;realtimeProjectId='';realtimeConnected=false;
+    if(clear){realtimeUsers=[];realtimeLocks={};updateRealtimeBadge()}
+  }
+  function sendRealtime(data){
+    if(!realtimeSocket||realtimeSocket.readyState!==WebSocket.OPEN)return false;
+    try{realtimeSocket.send(JSON.stringify(data));return true}catch(e){return false}
+  }
+  function queueRealtimeBroadcast(){
+    if(realtimeSuppress||!cloudUser||state.view!=='workspace'||!getProject())return;
+    clearTimeout(realtimeBroadcastTimer);
+    realtimeBroadcastTimer=setTimeout(()=>{
+      sendRealtime({type:'state:update',state,updatedAt:nowISO()});
+    },160);
+  }
+  function handleRealtimeMessage(raw){
+    let msg=null;try{msg=JSON.parse(raw)}catch(e){return}
+    if(msg.type==='welcome'||msg.type==='presence'){
+      realtimeConnected=true;
+      realtimeUsers=Array.isArray(msg.users)?msg.users:[];
+      realtimeLocks={};
+      realtimeUsers.forEach(u=>{if(u.clientId!==realtimeClientId&&u.editing?.fieldKey)realtimeLocks[u.editing.fieldKey]=u});
+      updateRealtimeBadge();return;
+    }
+    if(msg.type==='state:update'&&msg.state&&msg.from?.clientId!==realtimeClientId){
+      applyRemoteState(msg.state,msg.from);return;
+    }
+  }
+  async function applyRemoteState(remoteState,from){
+    const active=document.activeElement;
+    if(active&&active.matches('input,textarea')&&Date.now()-realtimeLastRemoteAt<900)return;
+    const localView=state.view,localSelected=state.selectedProjectId,localTab=state.activeTab;
+    const incoming=migrateState(remoteState);
+    state=incoming;
+    state.view=localView;
+    state.selectedProjectId=incoming.projects.some(p=>p.id===localSelected)?localSelected:(incoming.projects[0]?.id||'');
+    state.activeTab=localTab;
+    realtimeLastRemoteAt=Date.now();
+    realtimeSuppress=true;
+    await dbSet(workspaceStateKey(),state);
+    realtimeSuppress=false;
+    if(state.view==='workspace')renderWorkspace();else renderProjectsPage();
+    toast(`${from?.userName||'团队成员'} 已同步更新`);
+  }
+  function realtimeField(fieldKey,label){return `data-realtime-key="${esc(fieldKey)}" data-realtime-label="${esc(label)}"`}
+  function bindRealtimeInputs(){
+    $$('[data-realtime-key]').forEach(el=>{
+      const key=el.dataset.realtimeKey,label=el.dataset.realtimeLabel||'正在编辑';
+      el.addEventListener('focus',()=>sendRealtime({type:'editing:start',fieldKey:key,label}));
+      el.addEventListener('blur',()=>sendRealtime({type:'editing:end',fieldKey:key,label}));
+    });
+    applyRealtimeLocks();
+  }
+  function applyRealtimeLocks(){
+    $$('[data-realtime-key]').forEach(el=>{
+      const lock=realtimeLocks[el.dataset.realtimeKey];
+      const active=lock&&lock.clientId!==realtimeClientId;
+      el.classList.toggle('remote-locked',!!active);
+      if(active){el.title=`${lock.userName||'团队成员'} 正在编辑：${lock.editing?.label||''}`;if(document.activeElement!==el)el.readOnly=true}
+      else{el.title='';el.readOnly=false}
+    });
   }
 
   function createPrompt(manual=''){return {id:uid(),manual:String(manual||'')}}
@@ -370,6 +484,13 @@
       aplusSections:defaultAplusTitles.map(t=>createSection(t,'aplus'))
     };
   }
+  function workspaceStateKey(){
+    return cloudWorkspace?.id ? `${STATE_KEY}:${cloudWorkspace.id}` : STATE_KEY;
+  }
+  function emptyState(){
+    return {version:7,view:'projects',selectedProjectId:'',activeTab:'main',projects:[]};
+  }
+
   function initialState(){
     const p=createProject('示例项目｜产品视觉策划方案');
     p.brief='填写产品定位、目标人群、核心卖点、竞品参考和整体视觉方向。所有修改都会自动保存。';
@@ -379,7 +500,7 @@
     p.aplusSections[0].copy='主标题：Brand Story / Product Advantage\n副标题：用一句话说明产品价值';
     p.aplusSections[0].scene='宽幅品牌海报，产品位于视觉中心，背景体现目标用户使用场景。';
     p.aplusSections[0].prompts[0].manual='电影级柔和光线，高端商业广告风格，画面干净、可信。';
-    return {version:6,view:'projects',selectedProjectId:p.id,activeTab:'main',projects:[p]};
+    return {version:7,view:'projects',selectedProjectId:p.id,activeTab:'main',projects:[p]};
   }
 
   function migrateSection(section,type){
@@ -412,13 +533,12 @@
     };
   }
   function migrateState(raw){
-    if(!raw||!Array.isArray(raw.projects)) return initialState();
+    if(!raw||!Array.isArray(raw.projects)) return emptyState();
     const projects=raw.projects.map(migrateProject);
-    if(!projects.length) projects.push(createProject('新项目'));
     return {
-      version:6,
+      version:7,
       view:raw.view==='workspace'?'workspace':'projects',
-      selectedProjectId:projects.some(p=>p.id===raw.selectedProjectId)?raw.selectedProjectId:projects[0].id,
+      selectedProjectId:projects.some(p=>p.id===raw.selectedProjectId)?raw.selectedProjectId:(projects[0]?.id||''),
       activeTab:raw.activeTab==='aplus'?'aplus':'main',
       projects
     };
@@ -485,25 +605,37 @@ ${copy}`;
   }
   async function loadState(){
     await openDB();
-    let localRaw=await dbGet(STATE_KEY);
-    if(!localRaw){try{localRaw=JSON.parse(localStorage.getItem(STATE_KEY)||'null')}catch(e){localRaw=null}}
-    state=migrateState(localRaw);
     const hasSession=await checkCloudSession();
     if(hasSession){
+      const scopedKey=workspaceStateKey();
       try{
         const data=await apiFetch('/api/state');
-        if(data?.state)state=migrateState(data.state);
-        else await apiFetch('/api/state',{method:'PUT',body:{state}});
-        await dbSet(STATE_KEY,state);
-      }catch(e){console.warn('云端数据读取失败，使用本地备份',e);toast('云端读取失败，暂用本地备份')}
+        if(data?.state){
+          state=migrateState(data.state);
+        }else{
+          // 新团队必须从空项目库开始，不能把当前浏览器里的旧团队数据复制过去。
+          const scopedLocal=await dbGet(scopedKey);
+          state=scopedLocal?migrateState(scopedLocal):emptyState();
+          await apiFetch('/api/state',{method:'PUT',body:{state}});
+        }
+        await dbSet(scopedKey,state);
+      }catch(e){
+        console.warn('云端数据读取失败，尝试使用当前团队本地备份',e);
+        const scopedLocal=await dbGet(scopedKey);
+        state=scopedLocal?migrateState(scopedLocal):emptyState();
+        toast('云端读取失败，暂用当前团队本地备份');
+      }
+      return;
     }
+    // 未登录时只显示登录/注册页，不读取任何项目缓存，避免跨团队串数据。
+    state=emptyState();
   }
   async function saveState(show=false){
     if(!state)return;
     const p=getProject();if(p)p.updatedAt=nowISO();
-    await dbSet(STATE_KEY,state);updateSaveStatus();
+    await dbSet(workspaceStateKey(),state);updateSaveStatus();
     if(cloudUser&&cloudApiReady){
-      try{await apiFetch('/api/state',{method:'PUT',body:{state}});updateSaveStatus()}
+      try{await apiFetch('/api/state',{method:'PUT',body:{state}});updateSaveStatus();queueRealtimeBroadcast()}
       catch(e){console.warn('云端同步失败',e);if(show)toast('本地已保存，云端同步失败')}
     }
     if(show)toast(cloudUser?'已保存并同步到云端':'已保存到本地');
@@ -516,10 +648,10 @@ ${copy}`;
   function touch(section){if(section)section.updatedAt=nowISO();scheduleSave()}
 
   function render(){
-    if(cloudApiReady && !cloudUser)return renderAuthPage();
+    if(!cloudUser){disconnectRealtime();return renderAuthPage()}
     $('#navProjects').classList.toggle('active',state.view==='projects');
     $('#navCurrent').classList.toggle('active',state.view==='workspace');
-    if(state.view==='workspace'&&getProject())renderWorkspace();else renderProjectsPage();
+    if(state.view==='workspace'&&getProject())renderWorkspace();else{disconnectRealtime();renderProjectsPage()}
   }
 
   function renderAuthPage(){
@@ -528,8 +660,8 @@ ${copy}`;
       <div class="auth-page">
         <section class="auth-hero">
           <div class="eyebrow">Cloud Sync Version</div>
-          <h2>多人同步 · 长期保存</h2>
-          <p>登录后，项目、文案、尺寸、AI 提示词和图片都会保存到 Cloudflare。团队成员使用同一个团队码加入后，可以看到同一套项目数据。</p>
+          <h2>多人实时协作 · 长期保存</h2>
+          <p>登录后，项目、文案、尺寸、AI 提示词和图片都会保存到 Cloudflare。团队成员使用同一个团队码加入后，可以看到同一套项目数据；打开同一个项目时会进入实时协作房间，成员修改后其他人无需刷新即可看到更新。不同团队之间项目库完全隔离。此工具仅用于内部项目协作，不收集任何第三方平台账号、支付账号或平台登录信息。</p>
           <div class="auth-points">
             <div class="auth-point"><strong>GitHub</strong><span>继续保存网站代码，方便版本管理。</span></div>
             <div class="auth-point"><strong>Cloudflare Pages</strong><span>负责发布网页和运行 API。</span></div>
@@ -539,7 +671,7 @@ ${copy}`;
         </section>
         <section class="auth-card">
           <div class="auth-tabs"><button class="auth-tab active" data-auth-tab="login">登录</button><button class="auth-tab" data-auth-tab="register">注册</button></div>
-          <div class="auth-error" id="authError"></div>
+          <div class="auth-error ${cloudApiError?'show':''}" id="authError">${esc(cloudApiError||'')}</div>
           <form class="auth-form" id="loginForm">
             <div><div class="field-label">邮箱</div><input id="loginEmail" type="email" autocomplete="email" placeholder="name@example.com" required /></div>
             <div><div class="field-label">密码</div><input id="loginPassword" type="password" autocomplete="current-password" placeholder="输入密码" required /></div>
@@ -552,7 +684,7 @@ ${copy}`;
             <div><div class="field-label">密码</div><input id="registerPassword" type="password" autocomplete="new-password" placeholder="至少 6 位" required /></div>
             <div><div class="field-label">团队码（可选）</div><input id="registerInvite" type="text" placeholder="加入别人团队时填写；不填则创建新团队" /></div>
             <button class="btn primary" type="submit">注册并创建 / 加入团队</button>
-            <div class="auth-help">第一个注册的人会自动创建一个团队。进入系统后，页面顶部会显示团队名；团队码可在 README 的数据库中查看，也可以后续扩展为页面显示。</div>
+            <div class="auth-help">第一个注册的人会自动创建一个团队。进入系统后，页面顶部会显示团队码；其他成员注册时填写这个团队码即可加入。</div>
           </form>
         </section>
       </div>`;
@@ -620,8 +752,8 @@ ${copy}`;
       <div class="workspace-header">
         <div>
           <div class="back-link" id="backProjects">← 返回项目列表</div>
-          <input class="project-name-input" id="projectName" value="${esc(p.name)}" placeholder="项目名称" />
-          <div class="save-meta"><span class="status-dot"></span><span>自动保存</span><span id="saveStatus">更新：${formatTime(p.updatedAt)}</span></div>
+          <input class="project-name-input" id="projectName" value="${esc(p.name)}" placeholder="项目名称" ${realtimeField(`project:${p.id}:name`,`项目名称`)} />
+          <div class="save-meta"><span class="status-dot"></span><span>自动保存</span><span id="saveStatus">更新：${formatTime(p.updatedAt)}</span>${realtimeBadgeHtml()}</div>
         </div>
         <div class="header-actions">
           ${cloudBadge('light')}
@@ -633,7 +765,7 @@ ${copy}`;
       <div class="summary-grid">
         <section class="panel">
           <div class="panel-title"><h3>项目总策划</h3><span class="hint">产品定位、目标人群、核心卖点、视觉方向</span></div>
-          <textarea class="brief-textarea" id="projectBrief" placeholder="填写项目整体策划……">${esc(p.brief)}</textarea>
+          <textarea class="brief-textarea" id="projectBrief" placeholder="填写项目整体策划……" ${realtimeField(`project:${p.id}:brief`,`项目总策划`)}>${esc(p.brief)}</textarea>
         </section>
         <section class="panel">
           <div class="panel-title"><h3>项目概览</h3></div>
@@ -646,7 +778,7 @@ ${copy}`;
       <section class="panel bulk-prompt-panel">
         <div class="panel-title"><div><h3>批量更新提示词</h3><div class="hint">填写公共要求后，一键追加到当前项目每个主图与详情页 板块的全部提示词末尾。</div></div></div>
         <div class="bulk-prompt-row">
-          <textarea class="bulk-prompt-text" id="bulkPromptText" placeholder="例如：产品外观严格保持不变，电影级灯光，高端商业广告风格，超清晰细节……">${esc(p.bulkPrompt||'')}</textarea>
+          <textarea class="bulk-prompt-text" id="bulkPromptText" placeholder="例如：产品外观严格保持不变，电影级灯光，高端商业广告风格，超清晰细节……" ${realtimeField(`project:${p.id}:bulkPrompt`,`批量更新提示词`)}>${esc(p.bulkPrompt||'')}</textarea>
           <div class="bulk-prompt-actions"><button class="btn" id="clearBulkPrompt">清空内容</button><button class="btn primary" id="applyBulkPrompt">批量修改</button></div>
         </div>
       </section>
@@ -658,14 +790,16 @@ ${copy}`;
       </div>
       <div class="sections">${sections.map((s,i)=>renderSection(s,i)).join('')}</div>`;
     bindWorkspaceEvents();
+    connectRealtimeForCurrentProject();
+    updateRealtimeBadge();
   }
 
   function renderSection(section,index){
     return `<section class="section" data-section-id="${section.id}">
       <div class="section-head">
-        <div class="section-title-wrap"><span class="section-index">${String(index+1).padStart(2,'0')}</span><input class="section-title" data-field="title" value="${esc(section.title)}" /></div>
+        <div class="section-title-wrap"><span class="section-index">${String(index+1).padStart(2,'0')}</span><input class="section-title" data-field="title" value="${esc(section.title)}" ${realtimeField(`section:${section.id}:title`,`板块主题`)} /></div>
         <div class="section-head-right">
-          <div class="size-inline ${index===0?'applyable':''}"><label>像素要求 / 尺寸要求</label><input data-field="size" value="${esc(section.size)}" placeholder="例如：2000 × 2000 px / 1:1" />${index===0?'<button class="btn small primary size-apply-btn" type="button" data-action="apply-size-current-demand">一键批量应用</button>':''}</div>
+          <div class="size-inline ${index===0?'applyable':''}"><label>像素要求 / 尺寸要求</label><input data-field="size" value="${esc(section.size)}" placeholder="例如：2000 × 2000 px / 1:1" ${realtimeField(`section:${section.id}:size`,`像素 / 尺寸要求`)} />${index===0?'<button class="btn small primary size-apply-btn" type="button" data-action="apply-size-current-demand">一键批量应用</button>':''}</div>
           <div class="section-actions"><button class="btn small" data-action="copy-prompt">复制提示词</button><button class="btn small danger" data-action="delete-section">删除</button></div>
         </div>
       </div>
@@ -675,8 +809,8 @@ ${copy}`;
           ${renderImageBox(section,'materialImages','图片素材','场景、配色、质感、包装、图标或局部素材。','section')}
         </div>
         <div class="form-grid">
-          <div class="field full"><div class="field-label"><span>文案 <span class="hint">内容会自动同步到 AI 提示词</span></span><button class="btn small" type="button" data-action="append-copy-to-prompt">一键填入提示词</button></div><textarea class="copy" data-field="copy" placeholder="标题、副标题、标签、卖点文案……">${esc(section.copy)}</textarea></div>
-          <div class="field full"><div class="field-label">场景描述 / 图片要求</div><textarea class="scene" data-field="scene" placeholder="场景、构图、产品角度、人物、道具、光线等要求……">${esc(section.scene)}</textarea></div>
+          <div class="field full"><div class="field-label"><span>文案 <span class="hint">内容会自动同步到 AI 提示词</span></span><button class="btn small" type="button" data-action="append-copy-to-prompt">一键填入提示词</button></div><textarea class="copy" data-field="copy" placeholder="标题、副标题、标签、卖点文案……" ${realtimeField(`section:${section.id}:copy`,`文案`)}>${esc(section.copy)}</textarea></div>
+          <div class="field full"><div class="field-label">场景描述 / 图片要求</div><textarea class="scene" data-field="scene" placeholder="场景、构图、产品角度、人物、道具、光线等要求……" ${realtimeField(`section:${section.id}:scene`,`场景描述 / 图片要求`)}>${esc(section.scene)}</textarea></div>
           <div class="field full">
             <div class="field-label"><span>AI 提示词 <span class="sync-note">每条提示词都会自动同步“主题”“比例”和“文案”</span></span><button class="btn small primary" type="button" data-action="add-prompt">＋ 增加提示词</button></div>
             <div class="prompt-list">${section.prompts.length?section.prompts.map((prompt,promptIndex)=>renderPromptItem(section,prompt,promptIndex)).join(''):'<div class="prompt-empty">暂无提示词，点击“增加提示词”创建。</div>'}</div>
@@ -689,7 +823,7 @@ ${copy}`;
   function renderPromptItem(section,prompt,index){
     return `<div class="prompt-item" data-prompt-id="${prompt.id}">
       <div class="prompt-item-head"><div class="prompt-item-title"><span class="prompt-item-number">${String(index+1).padStart(2,'0')}</span><span>提示词 ${index+1}</span></div><button class="btn small danger" type="button" data-action="delete-prompt">删除提示词</button></div>
-      <textarea class="prompt" data-field="promptCombined" data-prompt-id="${prompt.id}" spellcheck="false">${esc(buildPrompt(section,prompt))}</textarea>
+      <textarea class="prompt" data-field="promptCombined" data-prompt-id="${prompt.id}" spellcheck="false" ${realtimeField(`prompt:${section.id}:${prompt.id}`,`AI 提示词 ${index+1}`)}>${esc(buildPrompt(section,prompt))}</textarea>
       <div class="prompt-tools"><button class="btn small" type="button" data-action="refresh-single-prompt">刷新自动内容</button><button class="btn small dark" type="button" data-action="copy-single-prompt">复制这条提示词</button></div>
     </div>`;
   }
@@ -765,6 +899,7 @@ ${copy}`;
       });
     });
     bindAllImageBoxes();
+    bindRealtimeInputs();
   }
 
   function bindAllImageBoxes(){
@@ -975,7 +1110,7 @@ ${copy}`;
   function bindCloudButtons(){
     $$('[data-action="logout-cloud"]').forEach(btn=>btn.onclick=async()=>{
       try{await saveState(false);await apiFetch('/api/auth/logout',{method:'POST',body:{}})}catch(e){}
-      cloudUser=null;cloudWorkspace=null;cloudApiReady=true;render();toast('已退出登录');
+      disconnectRealtime();cloudUser=null;cloudWorkspace=null;cloudApiReady=true;render();toast('已退出登录');
     });
   }
 
@@ -1004,7 +1139,7 @@ ${copy}`;
     if(lightboxOpen&&e.key==='ArrowRight'){e.preventDefault();moveLightbox(1)}
     if(e.key==='Escape'){closeLightbox();hideProjectModal()}
   });
-  window.addEventListener('beforeunload',()=>{if(saveTimer)saveState(false)});
+  window.addEventListener('beforeunload',()=>{sendRealtime({type:'editing:end'});if(saveTimer)saveState(false)});
 
   loadState().then(()=>{render();saveState(false)});
 })();
