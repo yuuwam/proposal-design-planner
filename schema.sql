@@ -64,3 +64,17 @@ CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token_hash);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_workspace_users_user ON workspace_users(user_id);
 CREATE INDEX IF NOT EXISTS idx_images_workspace ON images(workspace_id);
+
+CREATE TABLE IF NOT EXISTS collab_presence (
+  workspace_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  user_name TEXT,
+  user_email TEXT,
+  last_seen TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, project_id, client_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_collab_presence_project ON collab_presence(workspace_id, project_id, last_seen);
+

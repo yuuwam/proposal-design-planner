@@ -147,6 +147,7 @@ async function handleApi(context) {
     if (path === 'realtime') return await realtime(request, env, session, url);
     if (path === 'state' && request.method === 'GET') return await getState(env, session);
     if (path === 'state' && request.method === 'PUT') return await putState(request, env, session);
+    if (path === 'presence' && request.method === 'POST') return await updatePresence(request, env, session);
     if (path === 'workspace/join' && request.method === 'POST') return await joinWorkspace(request, env, session);
     if (path === 'images' && request.method === 'POST') return await uploadImage(request, env, session);
     if (path === 'images' && request.method === 'GET') return await getImage(request, env, session, url.searchParams.get('key'));
@@ -247,6 +248,57 @@ function encodeHeader(value) {
 }
 
 
+async function ensurePresenceTable(env) {
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS collab_presence (
+    workspace_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    user_name TEXT,
+    user_email TEXT,
+    last_seen TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, project_id, client_id)
+  )`).run();
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_collab_presence_project ON collab_presence(workspace_id,project_id,last_seen)').run();
+}
+
+async function updatePresence(request, env, session) {
+  const body = await readJson(request);
+  const projectId = clean(body.projectId);
+  const clientId = clean(body.clientId) || randomHex(8);
+  if (!projectId) return json({ message: '缺少 projectId' }, 400);
+  const now = new Date().toISOString();
+  const stale = new Date(Date.now() - 22000).toISOString();
+  async function writePresence() {
+    await env.DB.prepare(`INSERT INTO collab_presence (workspace_id,project_id,client_id,user_id,user_name,user_email,last_seen)
+      VALUES (?,?,?,?,?,?,?)
+      ON CONFLICT(workspace_id,project_id,client_id) DO UPDATE SET user_id=excluded.user_id,user_name=excluded.user_name,user_email=excluded.user_email,last_seen=excluded.last_seen`)
+      .bind(session.workspace.id, projectId, clientId, session.user.id, session.user.name || '', session.user.email || '', now).run();
+    await env.DB.prepare('DELETE FROM collab_presence WHERE last_seen<?').bind(stale).run();
+  }
+  try {
+    await writePresence();
+  } catch (err) {
+    if (String(err.message || '').includes('no such table') || String(err.message || '').includes('collab_presence')) {
+      await ensurePresenceTable(env);
+      await writePresence();
+    } else {
+      throw err;
+    }
+  }
+  const rows = await env.DB.prepare(`SELECT client_id,user_id,user_name,user_email,last_seen FROM collab_presence
+    WHERE workspace_id=? AND project_id=? AND last_seen>=? ORDER BY last_seen DESC`)
+    .bind(session.workspace.id, projectId, stale).all();
+  const users = (rows.results || []).map(row => ({
+    clientId: row.client_id,
+    userId: row.user_id,
+    userName: row.user_name,
+    userEmail: row.user_email,
+    lastSeen: row.last_seen
+  }));
+  return json({ ok: true, users, serverTime: now });
+}
+
 async function getState(env, session) {
   const row = await env.DB.prepare('SELECT state_json,updated_at,updated_by FROM planner_states WHERE workspace_id=?')
     .bind(session.workspace.id).first();
@@ -261,7 +313,7 @@ async function putState(request, env, session) {
   await env.DB.prepare(`INSERT INTO planner_states (workspace_id,state_json,updated_at,updated_by) VALUES (?,?,?,?)
     ON CONFLICT(workspace_id) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
     .bind(session.workspace.id, stateJson, now, session.user.id).run();
-  return json({ ok: true, updatedAt: now });
+  return json({ ok: true, updatedAt: now, updatedBy: session.user.id });
 }
 
 async function ensureEmptyPlannerState(env, workspaceId, userId) {

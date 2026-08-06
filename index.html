@@ -344,6 +344,8 @@
   let realtimeSuppress = false;
   let realtimeLastRemoteAt = 0;
   let cloudStateUpdatedAt = '';
+  let localDirty = false;
+  let saveGeneration = 0;
 
   const $ = (s,r=document) => r.querySelector(s);
   const $$ = (s,r=document) => Array.from(r.querySelectorAll(s));
@@ -432,8 +434,9 @@
     realtimeProjectId=p.id;
     realtimeClientId=realtimeClientId||uid();
     realtimeConnected=true;
-    realtimeUsers=[{clientId:realtimeClientId,userName:cloudUser.name,userEmail:cloudUser.email}];
+    realtimeUsers=[{clientId:realtimeClientId,userName:cloudUser.name,userEmail:cloudUser.email,lastSeen:nowISO()}];
     updateRealtimeBadge();
+    pollCloudStateForRealtime();
     realtimePollTimer=setInterval(pollCloudStateForRealtime,1800);
   }
   function disconnectRealtime(clear=true){
@@ -443,17 +446,30 @@
   }
   function sendRealtime(){return false}
   function queueRealtimeBroadcast(){
-    // Cloudflare Pages cannot define Durable Objects in the same Pages project.
-    // This deployable version uses D1 polling: saveState() writes to D1, teammates poll /api/state and apply updates without refreshing.
+    // Pages 兼容版使用 D1 轮询协作：保存时写入云端，其他成员通过 /api/state 和 /api/presence 自动拉取更新。
+  }
+  async function updatePresence(){
+    if(!realtimeProjectId||!cloudUser||!cloudApiReady)return;
+    const res=await apiFetch('/api/presence',{method:'POST',body:{projectId:realtimeProjectId,clientId:realtimeClientId}});
+    if(Array.isArray(res?.users)&&res.users.length){
+      realtimeUsers=res.users;
+      realtimeConnected=true;
+      updateRealtimeBadge();
+    }
   }
   async function pollCloudStateForRealtime(){
     if(realtimePollBusy||realtimeSuppress||!cloudUser||!cloudApiReady||state.view!=='workspace'||!getProject())return;
     realtimePollBusy=true;
     try{
+      await updatePresence();
       const data=await apiFetch('/api/state');
-      if(data?.state&&data.updatedAt&&data.updatedAt!==cloudStateUpdatedAt){
-        cloudStateUpdatedAt=data.updatedAt;
-        await applyRemoteState(data.state,{userName:'团队成员',userEmail:'云端更新'});
+      const activeKey=document.activeElement?.dataset?.realtimeKey||'';
+      const hasLocalPending=localDirty||!!saveTimer||!!activeKey;
+      if(data?.state&&data.updatedAt&&data.updatedAt!==cloudStateUpdatedAt&&data.updatedBy!==cloudUser.id){
+        if(!hasLocalPending){
+          cloudStateUpdatedAt=data.updatedAt;
+          await applyRemoteState(data.state,{userName:'团队成员',userEmail:'云端更新'});
+        }
       }
     }catch(e){
       realtimeConnected=false;updateRealtimeBadge();
@@ -461,6 +477,48 @@
       realtimePollBusy=false;
     }
   }
+  function maxTime(a,b){return String(a||'')>String(b||'')?(a||b):(b||a)}
+  function newerLocal(local,remote){return String(local?.updatedAt||'')>=String(remote?.updatedAt||'')}
+  function mergeImageArrays(remote=[],local=[]){
+    const map=new Map();
+    [...(remote||[]),...(local||[])].forEach(img=>{if(img&&img.id&&!map.has(img.id))map.set(img.id,img)});
+    return [...map.values()].sort((a,b)=>String(a.createdAt||'').localeCompare(String(b.createdAt||'')));
+  }
+  function mergeSections(remoteList=[],localList=[]){
+    const remoteMap=new Map((remoteList||[]).map(s=>[s.id,s]));
+    const localMap=new Map((localList||[]).map(s=>[s.id,s]));
+    const order=[...(localList||[]).map(s=>s.id),...(remoteList||[]).map(s=>s.id)].filter((id,i,a)=>id&&a.indexOf(id)===i);
+    return order.map(id=>{
+      const l=localMap.get(id), r=remoteMap.get(id);
+      if(!r)return l;
+      if(!l)return r;
+      return newerLocal(l,r)?l:r;
+    }).filter(Boolean);
+  }
+  function mergeProject(remoteProject,localProject){
+    if(!remoteProject)return localProject;
+    if(!localProject)return remoteProject;
+    const topLocal=newerLocal(localProject,remoteProject);
+    return {
+      ...remoteProject,
+      ...(topLocal?{name:localProject.name,brief:localProject.brief,bulkPrompt:localProject.bulkPrompt}:{}),
+      productImages:mergeImageArrays(remoteProject.productImages,localProject.productImages),
+      mainSections:mergeSections(remoteProject.mainSections,localProject.mainSections),
+      aplusSections:mergeSections(remoteProject.aplusSections,localProject.aplusSections),
+      updatedAt:maxTime(remoteProject.updatedAt,localProject.updatedAt),
+      createdAt:remoteProject.createdAt||localProject.createdAt
+    };
+  }
+  function mergeStates(remoteState,localState){
+    const remote=migrateState(remoteState||emptyState());
+    const local=migrateState(localState||emptyState());
+    const rMap=new Map(remote.projects.map(p=>[p.id,p]));
+    const lMap=new Map(local.projects.map(p=>[p.id,p]));
+    const order=[...local.projects.map(p=>p.id),...remote.projects.map(p=>p.id)].filter((id,i,a)=>id&&a.indexOf(id)===i);
+    const projects=order.map(id=>mergeProject(rMap.get(id),lMap.get(id))).filter(Boolean);
+    return {...remote,view:local.view,selectedProjectId:local.selectedProjectId,activeTab:local.activeTab,projects};
+  }
+
   async function applyRemoteState(remoteState,from){
     const active=document.activeElement;
     const activeKey=active?.dataset?.realtimeKey||'';
@@ -669,20 +727,36 @@ ${copy}`;
   }
   async function saveState(show=false){
     if(!state)return;
-    const p=getProject();if(p)p.updatedAt=nowISO();
+    const thisSave=++saveGeneration;
     await dbSet(workspaceStateKey(),state);updateSaveStatus();
     if(cloudUser&&cloudApiReady){
-      try{const saved=await apiFetch('/api/state',{method:'PUT',body:{state}});cloudStateUpdatedAt=saved?.updatedAt||cloudStateUpdatedAt;updateSaveStatus();queueRealtimeBroadcast()}
+      try{
+        let outbound=state;
+        try{
+          const latest=await apiFetch('/api/state');
+          if(latest?.state&&latest.updatedAt&&latest.updatedAt!==cloudStateUpdatedAt&&latest.updatedBy!==cloudUser.id){
+            outbound=mergeStates(latest.state,state);
+            state=outbound;
+            await dbSet(workspaceStateKey(),state);
+          }
+        }catch(e){console.warn('读取最新云端状态失败，继续保存当前内容',e)}
+        const saved=await apiFetch('/api/state',{method:'PUT',body:{state:outbound,clientId:realtimeClientId}});
+        cloudStateUpdatedAt=saved?.updatedAt||cloudStateUpdatedAt;
+        if(thisSave===saveGeneration)localDirty=false;
+        updateSaveStatus();queueRealtimeBroadcast();
+      }
       catch(e){console.warn('云端同步失败',e);if(show)toast('本地已保存，云端同步失败')}
+    }else{
+      localDirty=false;
     }
     if(show)toast(cloudUser?'已保存并同步到云端':'已保存到本地');
   }
-  function scheduleSave(){clearTimeout(saveTimer);saveTimer=setTimeout(()=>saveState(false),520)}
+  function scheduleSave(){localDirty=true;clearTimeout(saveTimer);saveTimer=setTimeout(()=>{saveTimer=null;saveState(false)},520)}
 
   function getProject(id=state.selectedProjectId){return state.projects.find(p=>p.id===id)||state.projects[0]||null}
   function getSections(project=getProject()){return state.activeTab==='aplus'?project.aplusSections:project.mainSections}
-  function findSection(id){const p=getProject();return [...p.mainSections,...p.aplusSections].find(s=>s.id===id)}
-  function touch(section){if(section)section.updatedAt=nowISO();scheduleSave()}
+  function findSection(id){const p=getProject();return p?[...p.mainSections,...p.aplusSections].find(s=>s.id===id):null}
+  function touch(section){if(section)section.updatedAt=nowISO();const p=getProject();if(p)p.updatedAt=nowISO();scheduleSave()}
 
   function render(){
     updateAccountEmailBox();
@@ -700,7 +774,7 @@ ${copy}`;
         <section class="auth-hero">
           <div class="eyebrow">Cloud Sync Version</div>
           <h2>多人协作同步 · 长期保存</h2>
-          <p>登录后，项目、文案、尺寸、AI 提示词和图片都会保存到 Cloudflare。团队成员使用同一个团队码加入后，可以看到同一套项目数据；打开同一个项目时会通过 D1 轮询同步，成员修改后其他人无需刷新即可看到更新。此工具仅用于内部项目协作，不收集任何第三方平台账号、支付账号或平台登录信息。</p>
+          <p>登录后，项目、文案、尺寸、AI 提示词和图片都会保存到 Cloudflare。团队成员使用同一个团队码加入后，可以看到同一套项目数据；打开同一个项目时会通过 D1 轮询同步，成员修改后其他人无需刷新即可看到更新。不同团队之间项目库完全隔离。此工具仅用于内部项目协作，不收集任何第三方平台账号、支付账号或平台登录信息。</p>
           <div class="auth-points">
             <div class="auth-point"><strong>GitHub</strong><span>继续保存网站代码，方便版本管理。</span></div>
             <div class="auth-point"><strong>Cloudflare Pages</strong><span>负责发布网页和运行 API。</span></div>
@@ -1180,7 +1254,7 @@ ${copy}`;
   });
   window.addEventListener('beforeunload',()=>{sendRealtime({type:'editing:end'});if(saveTimer)saveState(false)});
 
-  loadState().then(()=>{render();saveState(false)});
+  loadState().then(()=>{render()});
 })();
 </script>
 </body>
