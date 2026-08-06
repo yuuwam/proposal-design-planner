@@ -71,7 +71,7 @@ images
 
 ## 重要：配置 wrangler.jsonc
 
-因为实时协作需要 Durable Objects，建议直接通过 `wrangler.jsonc` 管理绑定。
+本版本是 Cloudflare Pages 兼容版，只需要 D1 绑定，不需要 R2，也不需要 Durable Objects。
 
 打开 D1 数据库的 Overview / Settings，复制真实的 Database ID，然后打开 GitHub 仓库里的 `wrangler.jsonc`，把这一行：
 
@@ -85,11 +85,10 @@ images
 "database_id": "12345678-abcd-1234-abcd-123456789000"
 ```
 
-不要改 `binding` 名称。必须保持：
+不要改 `binding` 名称，必须保持：
 
 ```text
 DB
-PROJECT_ROOM
 ```
 
 ## wrangler.jsonc 应包含
@@ -105,20 +104,6 @@ PROJECT_ROOM
       "binding": "DB",
       "database_name": "proposal-design-planner-db",
       "database_id": "这里替换成你的 D1 Database ID"
-    }
-  ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "PROJECT_ROOM",
-        "class_name": "ProjectRoom"
-      }
-    ]
-  },
-  "migrations": [
-    {
-      "tag": "v1_project_room",
-      "new_sqlite_classes": ["ProjectRoom"]
     }
   ]
 }
@@ -217,3 +202,10 @@ DELETE FROM planner_states;
 - 实时协作改为软编辑提示：其他成员正在编辑时只高亮提示，不再把输入框变成只读。
 - WebSocket 实时消息会同时写入 D1，避免多人同时打开同一个项目时出现“后打开的人无法保存”的问题。
 - 收到远程更新时会保留当前正在输入的字段内容，同时同步其他字段。
+
+
+## 重要修复：Cloudflare Pages 构建失败
+
+本版本已移除 `wrangler.jsonc` 中 Pages 不支持的 `migrations` 配置，也移除了同项目 Durable Object 绑定。Cloudflare Pages 的 Wrangler 配置不支持 `migrations`；如果 Pages 绑定 Durable Object，必须指定外部 Worker 的 `script_name`。因此本包改为 D1 轮询同步版，部署更简单，只需要 D1 绑定 `DB`。
+
+如果后续要做真正 WebSocket + Durable Object，需要额外创建一个单独 Worker 来承载 Durable Object，再让 Pages 通过 `script_name` 绑定它。

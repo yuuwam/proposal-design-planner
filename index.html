@@ -334,16 +334,16 @@
   let cloudWorkspace = null;
   let cloudApiReady = false;
   let cloudApiError = "";
-  let realtimeSocket = null;
   let realtimeProjectId = '';
   let realtimeClientId = '';
   let realtimeConnected = false;
   let realtimeUsers = [];
   let realtimeLocks = {};
-  let realtimeReconnectTimer = null;
-  let realtimeBroadcastTimer = null;
+  let realtimePollTimer = null;
+  let realtimePollBusy = false;
   let realtimeSuppress = false;
   let realtimeLastRemoteAt = 0;
+  let cloudStateUpdatedAt = '';
 
   const $ = (s,r=document) => r.querySelector(s);
   const $$ = (s,r=document) => Array.from(r.querySelectorAll(s));
@@ -410,7 +410,7 @@
 
   function realtimeBadgeHtml(){
     const cls=realtimeConnected?'':'warn';
-    const text=realtimeConnected?'实时协作已连接':'实时协作连接中';
+    const text=realtimeConnected?'云端协作同步已开启':'云端协作同步连接中';
     const count=realtimeUsers.length||1;
     const avatars=realtimeUsers.slice(0,5).map(u=>`<span class="presence-avatar" title="${esc(u.userName||u.userEmail||'成员')}">${esc((u.userName||u.userEmail||'成').slice(0,1).toUpperCase())}</span>`).join('');
     return `<span class="realtime-badge ${cls}" id="realtimeStatus"><span class="realtime-dot"></span>${text} · ${count}人在线</span><span class="presence-list" id="presenceList">${avatars}</span>`;
@@ -419,7 +419,7 @@
     const status=$('#realtimeStatus'),presence=$('#presenceList');
     if(status){
       status.className=`realtime-badge ${realtimeConnected?'':'warn'}`;
-      status.innerHTML=`<span class="realtime-dot"></span>${realtimeConnected?'实时协作已连接':'实时协作连接中'} · ${(realtimeUsers.length||1)}人在线`;
+      status.innerHTML=`<span class="realtime-dot"></span>${realtimeConnected?'云端协作同步已开启':'云端协作同步连接中'} · ${(realtimeUsers.length||1)}人在线`;
     }
     if(presence){presence.innerHTML=realtimeUsers.slice(0,5).map(u=>`<span class="presence-avatar" title="${esc(u.userName||u.userEmail||'成员')}">${esc((u.userName||u.userEmail||'成').slice(0,1).toUpperCase())}</span>`).join('')}
     applyRealtimeLocks();
@@ -427,46 +427,38 @@
   function connectRealtimeForCurrentProject(){
     const p=getProject();
     if(!cloudUser||!cloudApiReady||state.view!=='workspace'||!p){disconnectRealtime(false);return}
-    if(realtimeSocket&&realtimeProjectId===p.id&&(realtimeSocket.readyState===WebSocket.OPEN||realtimeSocket.readyState===WebSocket.CONNECTING))return;
+    if(realtimeProjectId===p.id&&realtimePollTimer)return;
     disconnectRealtime(false);
     realtimeProjectId=p.id;
     realtimeClientId=realtimeClientId||uid();
-    const proto=location.protocol==='https:'?'wss':'ws';
-    const wsUrl=`${proto}://${location.host}/api/realtime?projectId=${encodeURIComponent(p.id)}&clientId=${encodeURIComponent(realtimeClientId)}`;
-    try{realtimeSocket=new WebSocket(wsUrl)}catch(e){console.warn('实时协作连接失败',e);return}
-    realtimeSocket.onopen=()=>{realtimeConnected=true;updateRealtimeBadge();sendRealtime({type:'ping'})};
-    realtimeSocket.onmessage=e=>handleRealtimeMessage(e.data);
-    realtimeSocket.onclose=()=>{realtimeConnected=false;realtimeUsers=[];realtimeLocks={};updateRealtimeBadge();if(state?.view==='workspace'&&cloudUser){clearTimeout(realtimeReconnectTimer);realtimeReconnectTimer=setTimeout(connectRealtimeForCurrentProject,1800)}};
-    realtimeSocket.onerror=()=>{realtimeConnected=false;updateRealtimeBadge()};
+    realtimeConnected=true;
+    realtimeUsers=[{clientId:realtimeClientId,userName:cloudUser.name,userEmail:cloudUser.email}];
+    updateRealtimeBadge();
+    realtimePollTimer=setInterval(pollCloudStateForRealtime,1800);
   }
   function disconnectRealtime(clear=true){
-    clearTimeout(realtimeReconnectTimer);clearTimeout(realtimeBroadcastTimer);
-    if(realtimeSocket){try{realtimeSocket.close()}catch(e){}}
-    realtimeSocket=null;realtimeProjectId='';realtimeConnected=false;
+    if(realtimePollTimer)clearInterval(realtimePollTimer);
+    realtimePollTimer=null;realtimeProjectId='';realtimeConnected=false;realtimePollBusy=false;
     if(clear){realtimeUsers=[];realtimeLocks={};updateRealtimeBadge()}
   }
-  function sendRealtime(data){
-    if(!realtimeSocket||realtimeSocket.readyState!==WebSocket.OPEN)return false;
-    try{realtimeSocket.send(JSON.stringify(data));return true}catch(e){return false}
-  }
+  function sendRealtime(){return false}
   function queueRealtimeBroadcast(){
-    if(realtimeSuppress||!cloudUser||state.view!=='workspace'||!getProject())return;
-    clearTimeout(realtimeBroadcastTimer);
-    realtimeBroadcastTimer=setTimeout(()=>{
-      sendRealtime({type:'state:update',state,updatedAt:nowISO()});
-    },160);
+    // Cloudflare Pages cannot define Durable Objects in the same Pages project.
+    // This deployable version uses D1 polling: saveState() writes to D1, teammates poll /api/state and apply updates without refreshing.
   }
-  function handleRealtimeMessage(raw){
-    let msg=null;try{msg=JSON.parse(raw)}catch(e){return}
-    if(msg.type==='welcome'||msg.type==='presence'){
-      realtimeConnected=true;
-      realtimeUsers=Array.isArray(msg.users)?msg.users:[];
-      realtimeLocks={};
-      realtimeUsers.forEach(u=>{if(u.clientId!==realtimeClientId&&u.editing?.fieldKey)realtimeLocks[u.editing.fieldKey]=u});
-      updateRealtimeBadge();return;
-    }
-    if(msg.type==='state:update'&&msg.state&&msg.from?.clientId!==realtimeClientId){
-      applyRemoteState(msg.state,msg.from);return;
+  async function pollCloudStateForRealtime(){
+    if(realtimePollBusy||realtimeSuppress||!cloudUser||!cloudApiReady||state.view!=='workspace'||!getProject())return;
+    realtimePollBusy=true;
+    try{
+      const data=await apiFetch('/api/state');
+      if(data?.state&&data.updatedAt&&data.updatedAt!==cloudStateUpdatedAt){
+        cloudStateUpdatedAt=data.updatedAt;
+        await applyRemoteState(data.state,{userName:'团队成员',userEmail:'云端更新'});
+      }
+    }catch(e){
+      realtimeConnected=false;updateRealtimeBadge();
+    }finally{
+      realtimePollBusy=false;
     }
   }
   async function applyRemoteState(remoteState,from){
@@ -496,24 +488,19 @@
         }
       }
     }
-    toast(`${from?.userName||from?.userEmail||'团队成员'} 已同步更新`);
   }
   function realtimeField(fieldKey,label){return `data-realtime-key="${esc(fieldKey)}" data-realtime-label="${esc(label)}"`}
   function bindRealtimeInputs(){
     $$('[data-realtime-key]').forEach(el=>{
-      const key=el.dataset.realtimeKey,label=el.dataset.realtimeLabel||'正在编辑';
-      el.addEventListener('focus',()=>sendRealtime({type:'editing:start',fieldKey:key,label}));
-      el.addEventListener('blur',()=>sendRealtime({type:'editing:end',fieldKey:key,label}));
+      el.addEventListener('focus',()=>{});
+      el.addEventListener('blur',()=>{});
     });
     applyRealtimeLocks();
   }
   function applyRealtimeLocks(){
     $$('[data-realtime-key]').forEach(el=>{
-      const lock=realtimeLocks[el.dataset.realtimeKey];
-      const active=lock&&lock.clientId!==realtimeClientId;
-      el.classList.toggle('remote-locked',!!active);
-      if(active){el.title=`${lock.userName||lock.userEmail||'团队成员'} 正在编辑：${lock.editing?.label||''}；当前版本不再锁定输入，可继续编辑并实时同步。`}
-      else{el.title=''}
+      el.classList.remove('remote-locked');
+      el.title='';
       if(el.readOnly)el.readOnly=false;
     });
   }
@@ -659,13 +646,15 @@ ${copy}`;
       const scopedKey=workspaceStateKey();
       try{
         const data=await apiFetch('/api/state');
+        cloudStateUpdatedAt=data?.updatedAt||'';
         if(data?.state){
           state=migrateState(data.state);
         }else{
           // 团队隔离强制规则：云端没有数据时，新团队必须是空项目库。
           // 这里绝对不能读取浏览器本地缓存，否则同一台电脑切换团队会串项目。
           state=emptyState();
-          await apiFetch('/api/state',{method:'PUT',body:{state}});
+          const saved=await apiFetch('/api/state',{method:'PUT',body:{state}});
+          cloudStateUpdatedAt=saved?.updatedAt||cloudStateUpdatedAt;
         }
         await dbSet(scopedKey,state);
       }catch(e){
@@ -683,12 +672,12 @@ ${copy}`;
     const p=getProject();if(p)p.updatedAt=nowISO();
     await dbSet(workspaceStateKey(),state);updateSaveStatus();
     if(cloudUser&&cloudApiReady){
-      try{await apiFetch('/api/state',{method:'PUT',body:{state}});updateSaveStatus();queueRealtimeBroadcast()}
+      try{const saved=await apiFetch('/api/state',{method:'PUT',body:{state}});cloudStateUpdatedAt=saved?.updatedAt||cloudStateUpdatedAt;updateSaveStatus();queueRealtimeBroadcast()}
       catch(e){console.warn('云端同步失败',e);if(show)toast('本地已保存，云端同步失败')}
     }
     if(show)toast(cloudUser?'已保存并同步到云端':'已保存到本地');
   }
-  function scheduleSave(){clearTimeout(saveTimer);if(cloudUser&&cloudApiReady&&state?.view==='workspace')queueRealtimeBroadcast();saveTimer=setTimeout(()=>saveState(false),520)}
+  function scheduleSave(){clearTimeout(saveTimer);saveTimer=setTimeout(()=>saveState(false),520)}
 
   function getProject(id=state.selectedProjectId){return state.projects.find(p=>p.id===id)||state.projects[0]||null}
   function getSections(project=getProject()){return state.activeTab==='aplus'?project.aplusSections:project.mainSections}
@@ -710,8 +699,8 @@ ${copy}`;
       <div class="auth-page">
         <section class="auth-hero">
           <div class="eyebrow">Cloud Sync Version</div>
-          <h2>多人实时协作 · 长期保存</h2>
-          <p>登录后，项目、文案、尺寸、AI 提示词和图片都会保存到 Cloudflare。团队成员使用同一个团队码加入后，可以看到同一套项目数据；打开同一个项目时会进入实时协作房间，成员修改后其他人无需刷新即可看到更新。不同团队之间项目库完全隔离。此工具仅用于内部项目协作，不收集任何第三方平台账号、支付账号或平台登录信息。</p>
+          <h2>多人协作同步 · 长期保存</h2>
+          <p>登录后，项目、文案、尺寸、AI 提示词和图片都会保存到 Cloudflare。团队成员使用同一个团队码加入后，可以看到同一套项目数据；打开同一个项目时会通过 D1 轮询同步，成员修改后其他人无需刷新即可看到更新。不同团队之间项目库完全隔离。此工具仅用于内部项目协作，不收集任何第三方平台账号、支付账号或平台登录信息。</p>
           <div class="auth-points">
             <div class="auth-point"><strong>GitHub</strong><span>继续保存网站代码，方便版本管理。</span></div>
             <div class="auth-point"><strong>Cloudflare Pages</strong><span>负责发布网页和运行 API。</span></div>

@@ -7,21 +7,7 @@
     {
       "binding": "DB",
       "database_name": "proposal-design-planner-db",
-      "database_id": "3748deaf-1873-4eeb-ab9c-ab4d7a76328b"
-    }
-  ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "name": "PROJECT_ROOM",
-        "class_name": "ProjectRoom"
-      }
-    ]
-  },
-  "migrations": [
-    {
-      "tag": "v1_project_room",
-      "new_sqlite_classes": ["ProjectRoom"]
+      "database_id": "请替换成你的真实 D1 Database ID"
     }
   ]
 }

@@ -9,4 +9,4 @@ for (const file of ['index.html', '404.html', '_headers', '_redirects', '_worker
   const src = path.join(root, file);
   if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dist, file));
 }
-console.log('Build finished: dist/ with Pages advanced-mode _worker.js');
+console.log('Build finished: dist/ with Cloudflare Pages advanced mode and D1 binding');
