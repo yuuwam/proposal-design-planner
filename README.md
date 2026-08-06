@@ -1,6 +1,6 @@
-# Proposal Design Planner｜项目级实时协作版（方案 A）
+# Proposal Design Planner｜项目级实时协作（软编辑提示，不再锁死输入）版（方案 A）
 
-这是中性命名的 Cloudflare 免费版部署包，已从“多人同步”升级为“项目级实时协作”。
+这是中性命名的 Cloudflare 免费版部署包，已从“多人同步”升级为“项目级实时协作（软编辑提示，不再锁死输入）”。
 
 ## 当前版本能力
 
@@ -162,7 +162,7 @@ https://你的项目.pages.dev/api/me
 
 ## 注意事项
 
-这个版本是“项目级实时协作”，不是完整飞书 / 腾讯文档级 CRDT 文档协同。
+这个版本是“项目级实时协作（软编辑提示，不再锁死输入）”，不是完整飞书 / 腾讯文档级 CRDT 文档协同。
 
 适合：
 
@@ -178,3 +178,42 @@ https://你的项目.pages.dev/api/me
 - 完整版本历史与冲突恢复。
 
 如果后期需要完全接近飞书 / 腾讯文档，需要继续升级到字段级版本历史或 CRDT / Yjs 协同模型。
+
+
+## 团队隔离增强版说明
+
+本版本修复“不同团队看到同一批项目”的问题：
+
+- 登录 session 会绑定明确的 workspace_id。
+- 新团队第一次进入时，云端初始化为空项目库。
+- 已登录云端时不再读取浏览器本地缓存作为新团队数据源，避免同一台电脑切换账号/团队时串数据。
+
+如果使用旧 D1 数据库，请在 D1 Console 执行：
+
+```sql
+ALTER TABLE sessions ADD COLUMN workspace_id TEXT;
+UPDATE sessions
+SET workspace_id = (
+  SELECT wu.workspace_id
+  FROM workspace_users wu
+  WHERE wu.user_id = sessions.user_id
+  ORDER BY wu.created_at ASC
+  LIMIT 1
+)
+WHERE workspace_id IS NULL;
+```
+
+如果之前已经发生串数据，建议备份后执行：
+
+```sql
+DELETE FROM planner_states;
+```
+
+这只清空项目内容，不删除用户和团队。
+
+
+## 本版修复
+- 页面左下角显示当前登录账号邮箱和团队码。
+- 实时协作改为软编辑提示：其他成员正在编辑时只高亮提示，不再把输入框变成只读。
+- WebSocket 实时消息会同时写入 D1，避免多人同时打开同一个项目时出现“后打开的人无法保存”的问题。
+- 收到远程更新时会保留当前正在输入的字段内容，同时同步其他字段。

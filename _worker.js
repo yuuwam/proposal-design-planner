@@ -30,13 +30,13 @@ export class ProjectRoom {
     this.send(server, { type: 'welcome', clientId, users: this.users(), serverTime: new Date().toISOString() });
     this.broadcast({ type: 'presence', users: this.users(), serverTime: new Date().toISOString() }, clientId);
 
-    server.addEventListener('message', event => this.onMessage(clientId, event.data));
+    server.addEventListener('message', event => { this.onMessage(clientId, event.data).catch(err => this.send(server, { type: 'error', message: err?.message || '实时同步保存失败' })); });
     server.addEventListener('close', () => this.close(clientId));
     server.addEventListener('error', () => this.close(clientId));
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  onMessage(clientId, raw) {
+  async onMessage(clientId, raw) {
     const client = this.clients.get(clientId);
     if (!client) return;
     client.lastSeen = Date.now();
@@ -62,12 +62,14 @@ export class ProjectRoom {
       return;
     }
     if (msg.type === 'state:update' && msg.state && typeof msg.state === 'object') {
+      await this.persistState(client, msg.state, msg.updatedAt || now);
       this.broadcast({
         type: 'state:update',
         state: msg.state,
         updatedAt: msg.updatedAt || now,
         from: this.publicClient(client)
       }, clientId);
+      this.send(client.ws, { type: 'state:saved', updatedAt: msg.updatedAt || now });
       return;
     }
   }
@@ -100,6 +102,15 @@ export class ProjectRoom {
       lastSeen: client.lastSeen
     };
   }
+
+  async persistState(client, state, updatedAt) {
+    if (!this.env.DB || !client.workspaceId || !state || typeof state !== 'object') return;
+    const stateJson = JSON.stringify(state);
+    await this.env.DB.prepare(`INSERT INTO planner_states (workspace_id,state_json,updated_at,updated_by) VALUES (?,?,?,?)
+      ON CONFLICT(workspace_id) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
+      .bind(client.workspaceId, stateJson, updatedAt || new Date().toISOString(), client.userId || null).run();
+  }
+
 
   users() {
     return [...this.clients.values()].map(client => this.publicClient(client));
@@ -180,7 +191,10 @@ async function register(request, env) {
   await env.DB.prepare('INSERT OR IGNORE INTO workspace_users (workspace_id,user_id,role,created_at) VALUES (?,?,?,?)')
     .bind(workspace.id, userId, inviteCode ? 'member' : 'owner', now).run();
 
-  const session = await createSession(env, userId);
+  // 关键：注册后会话必须绑定当前 workspace，避免同一账号或浏览器串到其他团队。
+  // 新团队创建后立即写入一份空项目库，不能从浏览器缓存复制旧项目。
+  await ensureEmptyPlannerState(env, workspace.id, userId);
+  const session = await createSession(env, userId, workspace.id);
   return json({ user: publicUser({ id: userId, name, email }), workspace: publicWorkspace(workspace) }, 200, sessionCookie(session.token));
 }
 
@@ -192,8 +206,9 @@ async function login(request, env) {
   if (!user) return json({ message: '邮箱或密码不正确' }, 401);
   const ok = await verifyPassword(password, user.password_salt, user.password_hash);
   if (!ok) return json({ message: '邮箱或密码不正确' }, 401);
-  const session = await createSession(env, user.id);
   const workspace = await firstWorkspace(env, user.id);
+  if (!workspace) return json({ message: '当前账号没有团队空间' }, 403);
+  const session = await createSession(env, user.id, workspace.id);
   return json({ user: publicUser(user), workspace: publicWorkspace(workspace) }, 200, sessionCookie(session.token));
 }
 
@@ -249,6 +264,13 @@ async function putState(request, env, session) {
   return json({ ok: true, updatedAt: now });
 }
 
+async function ensureEmptyPlannerState(env, workspaceId, userId) {
+  const now = new Date().toISOString();
+  const empty = JSON.stringify({ version: 7, view: 'projects', selectedProjectId: '', activeTab: 'main', projects: [] });
+  await env.DB.prepare(`INSERT OR IGNORE INTO planner_states (workspace_id,state_json,updated_at,updated_by) VALUES (?,?,?,?)`)
+    .bind(workspaceId, empty, now, userId || null).run();
+}
+
 async function joinWorkspace(request, env, session) {
   const body = await readJson(request);
   const inviteCode = clean(body.inviteCode).toUpperCase();
@@ -256,7 +278,10 @@ async function joinWorkspace(request, env, session) {
   if (!workspace) return json({ message: '团队码不存在' }, 404);
   await env.DB.prepare('INSERT OR IGNORE INTO workspace_users (workspace_id,user_id,role,created_at) VALUES (?,?,?,?)')
     .bind(workspace.id, session.user.id, 'member', new Date().toISOString()).run();
-  return json({ ok: true, workspace: publicWorkspace(workspace) });
+  await ensureEmptyPlannerState(env, workspace.id, session.user.id);
+  // 加入团队后直接切换当前会话到目标团队，避免仍读取原团队。
+  const newSession = await createSession(env, session.user.id, workspace.id);
+  return json({ ok: true, workspace: publicWorkspace(workspace) }, 200, sessionCookie(newSession.token));
 }
 
 async function uploadImage(request, env, session) {
@@ -315,10 +340,17 @@ async function requireSession(request, env) {
   const token = readCookie(request, COOKIE_NAME);
   if (!token) throw httpError('请先登录', 401);
   const tokenHash = await sha256Hex(token);
-  const row = await env.DB.prepare(`SELECT s.id session_id,s.expires_at,u.id user_id,u.name,u.email
+  const row = await env.DB.prepare(`SELECT s.id session_id,s.expires_at,s.workspace_id,u.id user_id,u.name,u.email
     FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?`).bind(tokenHash).first();
   if (!row || new Date(row.expires_at) < new Date()) throw httpError('登录已过期，请重新登录', 401);
-  const workspace = await firstWorkspace(env, row.user_id);
+
+  let workspace = null;
+  if (row.workspace_id) {
+    workspace = await env.DB.prepare(`SELECT w.* FROM workspaces w
+      JOIN workspace_users wu ON wu.workspace_id=w.id
+      WHERE w.id=? AND wu.user_id=? LIMIT 1`).bind(row.workspace_id, row.user_id).first();
+  }
+  if (!workspace) workspace = await firstWorkspace(env, row.user_id);
   if (!workspace) throw httpError('当前账号没有团队空间', 403);
   return { user: { id: row.user_id, name: row.name, email: row.email }, workspace };
 }
@@ -328,13 +360,19 @@ async function firstWorkspace(env, userId) {
     WHERE wu.user_id=? ORDER BY wu.created_at ASC LIMIT 1`).bind(userId).first();
 }
 
-async function createSession(env, userId) {
+async function createSession(env, userId, workspaceId) {
   const token = randomHex(32);
   const tokenHash = await sha256Hex(token);
   const now = new Date();
   const expires = new Date(now.getTime() + SESSION_DAYS * 86400 * 1000).toISOString();
-  await env.DB.prepare('INSERT INTO sessions (id,user_id,token_hash,expires_at,created_at) VALUES (?,?,?,?,?)')
-    .bind(id('ses'), userId, tokenHash, expires, now.toISOString()).run();
+  try {
+    await env.DB.prepare('INSERT INTO sessions (id,user_id,workspace_id,token_hash,expires_at,created_at) VALUES (?,?,?,?,?,?)')
+      .bind(id('ses'), userId, workspaceId || null, tokenHash, expires, now.toISOString()).run();
+  } catch (err) {
+    // 兼容还没执行迁移 SQL 的旧库。旧库仍可登录，但建议执行 upgrade_workspace_session.sql。
+    await env.DB.prepare('INSERT INTO sessions (id,user_id,token_hash,expires_at,created_at) VALUES (?,?,?,?,?)')
+      .bind(id('ses'), userId, tokenHash, expires, now.toISOString()).run();
+  }
   return { token, expires };
 }
 

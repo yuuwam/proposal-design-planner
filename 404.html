@@ -235,6 +235,11 @@
       .lightbox-prev{left:8px}.lightbox-next{right:8px}
     }
 
+    .account-email-box{position:fixed;left:18px;bottom:18px;width:244px;z-index:35;background:rgba(18,21,27,.94);border:1px solid rgba(255,184,77,.28);box-shadow:0 18px 45px rgba(0,0,0,.28);border-radius:16px;padding:11px 12px;color:#fff;backdrop-filter:blur(10px)}
+    .account-email-box .account-label{font-size:10px;color:#8f99ad;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px}
+    .account-email-box .account-mail{font-size:12px;font-weight:800;color:#fff3df;word-break:break-all;line-height:1.35}
+    .account-email-box .account-team{font-size:10px;color:#aab3c5;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    @media(max-width:930px){.account-email-box{position:static;width:auto;margin-top:12px}.sidebar{flex-wrap:wrap}.account-email-box .account-team{white-space:normal}}
     .cloud-badge{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid rgba(255,184,77,.32);background:rgba(255,184,77,.10);border-radius:999px;color:#fff3df;font-size:12px;white-space:nowrap}
     .cloud-badge strong{color:#fff;font-weight:800;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .cloud-badge button{border:0;background:rgba(255,255,255,.13);color:#fff;border-radius:999px;padding:5px 9px;font-size:11px}
@@ -268,6 +273,7 @@
         <input class="hidden" id="importFile" type="file" accept="application/json" />
       </div>
       <p class="side-note">云端同步保存，浏览器保留本地备份。多人共用同一个团队码即可同步。</p>
+      <div class="account-email-box hidden" id="accountEmailBox"></div>
     </aside>
 
     <main class="main">
@@ -330,7 +336,7 @@
   let cloudApiError = "";
   let realtimeSocket = null;
   let realtimeProjectId = '';
-  let realtimeClientId = uid();
+  let realtimeClientId = '';
   let realtimeConnected = false;
   let realtimeUsers = [];
   let realtimeLocks = {};
@@ -362,6 +368,35 @@
     const name=cloudWorkspace?.name||'云端团队';
     const invite=cloudWorkspace?.inviteCode?`团队码：${esc(cloudWorkspace.inviteCode)}`:'云端已连接';
     return `<div class="cloud-badge ${theme==='light'?'light':''}" title="${esc(invite)}"><span>云端同步</span><strong>${esc(name)}</strong><span>${invite}</span><button data-action="logout-cloud">退出</button></div>`;
+  }
+  function updateAccountEmailBox(){
+    const el=$('#accountEmailBox');
+    if(!el)return;
+    if(!cloudUser?.email){el.classList.add('hidden');el.innerHTML='';return}
+    const team=cloudWorkspace?.name||'当前团队';
+    const invite=cloudWorkspace?.inviteCode?` · 团队码 ${cloudWorkspace.inviteCode}`:'';
+    el.classList.remove('hidden');
+    el.innerHTML=`<div class="account-label">当前登录账号</div><div class="account-mail">${esc(cloudUser.email)}</div><div class="account-team">${esc(team+invite)}</div>`;
+  }
+  function findRealtimeEl(key){return $$('[data-realtime-key]').find(el=>el.dataset.realtimeKey===key)||null}
+  function applyValueByRealtimeKey(targetState,key,value){
+    if(!targetState||!key)return;
+    const parts=String(key).split(':');
+    if(parts[0]==='project'){
+      const project=targetState.projects.find(p=>p.id===parts[1]);
+      if(project&&['name','brief','bulkPrompt'].includes(parts[2]))project[parts[2]]=value;
+      return;
+    }
+    if(parts[0]==='section'){
+      const section=targetState.projects.flatMap(p=>[...(p.mainSections||[]),...(p.aplusSections||[])]).find(s=>s.id===parts[1]);
+      if(section&&['title','size','copy','scene'].includes(parts[2]))section[parts[2]]=value;
+      return;
+    }
+    if(parts[0]==='prompt'){
+      const section=targetState.projects.flatMap(p=>[...(p.mainSections||[]),...(p.aplusSections||[])]).find(s=>s.id===parts[1]);
+      const prompt=section?.prompts?.find(p=>p.id===parts[2]);
+      if(prompt)prompt.manual=extractManualPrompt(value);
+    }
   }
   async function checkCloudSession(){
     try{const data=await apiFetch('/api/me');cloudUser=data.user;cloudWorkspace=data.workspace;cloudApiReady=true;cloudApiError='';return true}
@@ -436,9 +471,13 @@
   }
   async function applyRemoteState(remoteState,from){
     const active=document.activeElement;
-    if(active&&active.matches('input,textarea')&&Date.now()-realtimeLastRemoteAt<900)return;
+    const activeKey=active?.dataset?.realtimeKey||'';
+    const activeValue=activeKey&&('value' in active)?active.value:'';
+    const selStart=active&&typeof active.selectionStart==='number'?active.selectionStart:null;
+    const selEnd=active&&typeof active.selectionEnd==='number'?active.selectionEnd:null;
     const localView=state.view,localSelected=state.selectedProjectId,localTab=state.activeTab;
     const incoming=migrateState(remoteState);
+    if(activeKey)applyValueByRealtimeKey(incoming,activeKey,activeValue);
     state=incoming;
     state.view=localView;
     state.selectedProjectId=incoming.projects.some(p=>p.id===localSelected)?localSelected:(incoming.projects[0]?.id||'');
@@ -448,7 +487,16 @@
     await dbSet(workspaceStateKey(),state);
     realtimeSuppress=false;
     if(state.view==='workspace')renderWorkspace();else renderProjectsPage();
-    toast(`${from?.userName||'团队成员'} 已同步更新`);
+    if(activeKey){
+      const restored=findRealtimeEl(activeKey);
+      if(restored){
+        restored.focus();
+        if(selStart!==null&&typeof restored.setSelectionRange==='function'){
+          try{restored.setSelectionRange(Math.min(selStart,restored.value.length),Math.min(selEnd??selStart,restored.value.length))}catch(e){}
+        }
+      }
+    }
+    toast(`${from?.userName||from?.userEmail||'团队成员'} 已同步更新`);
   }
   function realtimeField(fieldKey,label){return `data-realtime-key="${esc(fieldKey)}" data-realtime-label="${esc(label)}"`}
   function bindRealtimeInputs(){
@@ -464,8 +512,9 @@
       const lock=realtimeLocks[el.dataset.realtimeKey];
       const active=lock&&lock.clientId!==realtimeClientId;
       el.classList.toggle('remote-locked',!!active);
-      if(active){el.title=`${lock.userName||'团队成员'} 正在编辑：${lock.editing?.label||''}`;if(document.activeElement!==el)el.readOnly=true}
-      else{el.title='';el.readOnly=false}
+      if(active){el.title=`${lock.userName||lock.userEmail||'团队成员'} 正在编辑：${lock.editing?.label||''}；当前版本不再锁定输入，可继续编辑并实时同步。`}
+      else{el.title=''}
+      if(el.readOnly)el.readOnly=false;
     });
   }
 
@@ -613,17 +662,16 @@ ${copy}`;
         if(data?.state){
           state=migrateState(data.state);
         }else{
-          // 新团队必须从空项目库开始，不能把当前浏览器里的旧团队数据复制过去。
-          const scopedLocal=await dbGet(scopedKey);
-          state=scopedLocal?migrateState(scopedLocal):emptyState();
+          // 团队隔离强制规则：云端没有数据时，新团队必须是空项目库。
+          // 这里绝对不能读取浏览器本地缓存，否则同一台电脑切换团队会串项目。
+          state=emptyState();
           await apiFetch('/api/state',{method:'PUT',body:{state}});
         }
         await dbSet(scopedKey,state);
       }catch(e){
-        console.warn('云端数据读取失败，尝试使用当前团队本地备份',e);
-        const scopedLocal=await dbGet(scopedKey);
-        state=scopedLocal?migrateState(scopedLocal):emptyState();
-        toast('云端读取失败，暂用当前团队本地备份');
+        console.warn('云端数据读取失败',e);
+        state=emptyState();
+        toast('云端读取失败，请检查登录状态和 D1 绑定');
       }
       return;
     }
@@ -640,7 +688,7 @@ ${copy}`;
     }
     if(show)toast(cloudUser?'已保存并同步到云端':'已保存到本地');
   }
-  function scheduleSave(){clearTimeout(saveTimer);saveTimer=setTimeout(()=>saveState(false),520)}
+  function scheduleSave(){clearTimeout(saveTimer);if(cloudUser&&cloudApiReady&&state?.view==='workspace')queueRealtimeBroadcast();saveTimer=setTimeout(()=>saveState(false),520)}
 
   function getProject(id=state.selectedProjectId){return state.projects.find(p=>p.id===id)||state.projects[0]||null}
   function getSections(project=getProject()){return state.activeTab==='aplus'?project.aplusSections:project.mainSections}
@@ -648,6 +696,7 @@ ${copy}`;
   function touch(section){if(section)section.updatedAt=nowISO();scheduleSave()}
 
   function render(){
+    updateAccountEmailBox();
     if(!cloudUser){disconnectRealtime();return renderAuthPage()}
     $('#navProjects').classList.toggle('active',state.view==='projects');
     $('#navCurrent').classList.toggle('active',state.view==='workspace');
@@ -655,6 +704,7 @@ ${copy}`;
   }
 
   function renderAuthPage(){
+    updateAccountEmailBox();
     $('#navProjects').classList.remove('active');$('#navCurrent').classList.remove('active');
     $('#root').innerHTML=`
       <div class="auth-page">
