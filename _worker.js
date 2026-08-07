@@ -474,13 +474,48 @@ async function assertProjectEditable(env, session, projectId, clientId, options 
     .bind(workspaceId, projectId).first();
   const active = row && new Date(row.expires_at).getTime() > Date.now();
   const ownsLock = active && String(row.client_id || '') === String(clientId || '');
-  // 服务器端硬限制：凡是修改已有项目，必须持有这个项目的有效编辑锁。
-  // 不能只靠前端 disabled/readOnly，因为浏览器状态可能被缓存或脚本绕过。
-  if (!ownsLock) {
-    const err = new Error(active ? '当前项目正在被其他窗口或成员编辑，无法保存' : '当前项目未获得编辑权限，无法保存');
-    err.status = 423;
-    throw err;
+  if (ownsLock) return;
+
+  // 如果这个项目当前没有有效锁，允许当前请求自动获得编辑权并继续保存。
+  // 这样普通团队成员在页面锁状态未及时刷新时，不会误报“未获得编辑权限”。
+  // 如果已经有其他窗口/成员持有有效锁，则仍然严格拒绝，保证同一项目同一时间只允许一人编辑。
+  if (!active) {
+    if (!clientId) {
+      const err = new Error('缺少编辑窗口标识，无法保存');
+      err.status = 423;
+      throw err;
+    }
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + PROJECT_LOCK_TTL_MS).toISOString();
+    await env.DB.prepare(`INSERT INTO project_locks (workspace_id,project_id,locked_by_user_id,locked_by_email,locked_by_name,client_id,locked_at,last_seen,expires_at)
+      VALUES (?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(workspace_id,project_id) DO UPDATE SET locked_by_user_id=excluded.locked_by_user_id,locked_by_email=excluded.locked_by_email,locked_by_name=excluded.locked_by_name,client_id=excluded.client_id,locked_at=excluded.locked_at,last_seen=excluded.last_seen,expires_at=excluded.expires_at`)
+      .bind(workspaceId, projectId, session.user.id, session.user.email || '', session.user.name || '', clientId, now, now, expiresAt).run();
+    return;
   }
+
+  const err = new Error('当前项目正在被其他窗口或成员编辑，无法保存');
+  err.status = 423;
+  throw err;
+}
+
+function preserveAdminOnlyFieldsForMember(oldState, newState) {
+  const output = JSON.parse(JSON.stringify(newState || {}));
+  const oldProjects = new Map((Array.isArray(oldState?.projects) ? oldState.projects : []).map(p => [String(p.id || ''), p]));
+  for (const project of Array.isArray(output.projects) ? output.projects : []) {
+    const oldProject = oldProjects.get(String(project.id || ''));
+    if (!oldProject) continue;
+    // 批量更新提示词只允许管理员维护，普通成员保存其他字段时不能覆盖它。
+    project.bulkPrompt = oldProject.bulkPrompt || '';
+    const oldSections = new Map([...(oldProject.mainSections || []), ...(oldProject.aplusSections || [])].map(s => [String(s.id || ''), s]));
+    for (const section of [...(project.mainSections || []), ...(project.aplusSections || [])]) {
+      const oldSection = oldSections.get(String(section.id || ''));
+      if (!oldSection) continue;
+      // AI 提示词只允许管理员维护。普通成员仍可编辑标题、尺寸、文案、场景、图片等字段。
+      section.prompts = Array.isArray(oldSection.prompts) ? oldSection.prompts : [];
+    }
+  }
+  return output;
 }
 
 function projectMapFromState(state) {
@@ -547,11 +582,15 @@ async function putState(request, env, session) {
     .bind(session.workspace.id).first();
   const oldState = current?.state_json ? JSON.parse(current.state_json) : { projects: [] };
 
-  // 最关键的协同保证：任何项目内容变化，都必须在服务器端校验项目锁。
-  // 即使前端显示错、按钮没禁用、用户手动调用 API，也不能绕过。
-  await assertStateMutationAllowed(env, session, oldState, body.state, clean(body.clientId), clean(body.projectId), clean(body.projectWorkspaceId));
+  // 普通团队成员可以编辑除 AI 提示词 / 批量提示词以外的项目内容。
+  // 保存前先恢复管理员专属字段，防止普通账号隐藏这些板块后误覆盖提示词数据。
+  const incomingState = preserveAdminOnlyFieldsForMember(oldState, body.state);
 
-  const stateJson = JSON.stringify(body.state);
+  // 最关键的协同保证：任何项目内容变化，都必须在服务器端校验项目锁。
+  // 如果当前没有有效锁，服务器会自动给当前窗口获得锁；如果别人持有锁，则拒绝保存。
+  await assertStateMutationAllowed(env, session, oldState, incomingState, clean(body.clientId), clean(body.projectId), clean(body.projectWorkspaceId));
+
+  const stateJson = JSON.stringify(incomingState);
   const now = new Date().toISOString();
   await env.DB.prepare(`INSERT INTO planner_states (workspace_id,state_json,updated_at,updated_by) VALUES (?,?,?,?)
     ON CONFLICT(workspace_id) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)

@@ -485,15 +485,7 @@
     const who=lock.lockedByEmail||lock.lockedByName||'其他成员';
     return `<span class="edit-badge locked" title="正在由 ${esc(who)} 编辑">无法编辑</span>`;
   }
-  function currentLockBannerHtml(){
-    if(!cloudUser)return '';
-    const lock=currentProjectLock;
-    if(!lock||lock.status==='checking')return '<div class="edit-lock-banner checking">正在检查项目编辑状态……</div>';
-    if(lock.canEdit)return '<div class="edit-lock-banner can-edit">可编辑：你已获得当前项目的编辑权限。保持页面打开时会自动续期。</div>';
-    const who=lock.lockedByEmail||lock.lockedByName||'其他成员';
-    const until=lock.expiresAt?formatTime(lock.expiresAt):'稍后';
-    return `<div class="edit-lock-banner cannot-edit">无法编辑：当前项目正在由 ${esc(who)} 编辑。你现在只能查看，预计 ${esc(until)} 后自动释放。</div>`;
-  }
+  function currentLockBannerHtml(){return ''}
   async function refreshProjectLocks(){
     if(!cloudUser||!cloudApiReady)return;
     try{
@@ -938,10 +930,16 @@ ${copy}`;
     if(!state)return;
     const lockedProject=state.view==='workspace'?getProject():null;
     if(cloudUser&&lockedProject&&!canEditProject(lockedProject.id)){
-      localDirty=false;
-      updateSaveStatus();
-      if(show)toast('当前项目无法编辑，未保存修改');
-      return;
+      // 如果只是锁状态没有及时获得，先尝试获取编辑权；只有别人已锁定时才停止保存。
+      try{
+        await acquireProjectLock(lockedProject.id);
+      }catch(e){}
+      if(!canEditProject(lockedProject.id)){
+        localDirty=false;
+        updateSaveStatus();
+        if(show)toast('当前项目正在被编辑，未保存修改');
+        return;
+      }
     }
     const thisSave=++saveGeneration;
     await dbSet(workspaceStateKey(),state);updateSaveStatus();
@@ -1099,7 +1097,6 @@ ${copy}`;
           <div class="back-link" id="backProjects">← 返回项目列表</div>
           <input class="project-name-input" id="projectName" value="${esc(p.name)}" placeholder="项目名称" ${realtimeField(`project:${p.id}:name`,`项目名称`)} />
           <div class="save-meta"><span class="status-dot"></span><span>自动保存</span><span id="saveStatus">更新：${formatTime(p.updatedAt)}</span>${realtimeBadgeHtml()}</div>
-          <div id="editLockBanner">${currentLockBannerHtml()}</div>
         </div>
         <div class="header-actions">
           ${cloudBadge('light')}
