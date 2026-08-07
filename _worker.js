@@ -402,16 +402,52 @@ async function releaseProjectLock(request, env, session) {
   return json({ ok: true });
 }
 
-async function assertProjectEditable(env, session, projectId, clientId) {
+async function assertProjectEditable(env, session, projectId, clientId, options = {}) {
+  projectId = clean(projectId);
+  clientId = clean(clientId);
   if (!projectId) return;
   await cleanupExpiredProjectLocks(env);
   const row = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=? AND project_id=?')
     .bind(session.workspace.id, projectId).first();
-  if (!row) return;
-  if (String(row.client_id || '') !== String(clientId || '') && new Date(row.expires_at).getTime() > Date.now()) {
-    const err = new Error('当前项目正在被其他窗口或成员编辑，无法保存');
+  const active = row && new Date(row.expires_at).getTime() > Date.now();
+  const ownsLock = active && String(row.client_id || '') === String(clientId || '');
+  // 服务器端硬限制：凡是修改已有项目，必须持有这个项目的有效编辑锁。
+  // 不能只靠前端 disabled/readOnly，因为浏览器状态可能被缓存或脚本绕过。
+  if (!ownsLock) {
+    const err = new Error(active ? '当前项目正在被其他窗口或成员编辑，无法保存' : '当前项目未获得编辑权限，无法保存');
     err.status = 423;
     throw err;
+  }
+}
+
+function projectMapFromState(state) {
+  const map = new Map();
+  for (const p of Array.isArray(state?.projects) ? state.projects : []) {
+    if (p && p.id) map.set(String(p.id), p);
+  }
+  return map;
+}
+
+function changedExistingProjectIds(oldState, newState) {
+  const oldMap = projectMapFromState(oldState);
+  const newMap = projectMapFromState(newState);
+  const changed = new Set();
+  for (const [id, oldProject] of oldMap.entries()) {
+    const nextProject = newMap.get(id);
+    if (!nextProject) {
+      changed.add(id);
+      continue;
+    }
+    if (JSON.stringify(oldProject) !== JSON.stringify(nextProject)) changed.add(id);
+  }
+  return [...changed];
+}
+
+async function assertStateMutationAllowed(env, session, oldState, newState, clientId, hintedProjectId) {
+  const changed = changedExistingProjectIds(oldState, newState);
+  if (hintedProjectId && !changed.includes(hintedProjectId) && projectMapFromState(oldState).has(hintedProjectId)) changed.push(hintedProjectId);
+  for (const projectId of changed) {
+    await assertProjectEditable(env, session, projectId, clientId);
   }
 }
 
@@ -424,7 +460,15 @@ async function getState(env, session) {
 async function putState(request, env, session) {
   const body = await readJson(request);
   if (!body.state || typeof body.state !== 'object') return json({ message: '缺少 state 数据' }, 400);
-  await assertProjectEditable(env, session, clean(body.projectId), clean(body.clientId));
+
+  const current = await env.DB.prepare('SELECT state_json FROM planner_states WHERE workspace_id=?')
+    .bind(session.workspace.id).first();
+  const oldState = current?.state_json ? JSON.parse(current.state_json) : { projects: [] };
+
+  // 最关键的协同保证：任何项目内容变化，都必须在服务器端校验项目锁。
+  // 即使前端显示错、按钮没禁用、用户手动调用 API，也不能绕过。
+  await assertStateMutationAllowed(env, session, oldState, body.state, clean(body.clientId), clean(body.projectId));
+
   const stateJson = JSON.stringify(body.state);
   const now = new Date().toISOString();
   await env.DB.prepare(`INSERT INTO planner_states (workspace_id,state_json,updated_at,updated_by) VALUES (?,?,?,?)

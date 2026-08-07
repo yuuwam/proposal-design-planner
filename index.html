@@ -194,6 +194,10 @@
     .modal{width:min(520px,100%);background:#fff;color:#171b24;border-radius:22px;box-shadow:0 28px 90px rgba(0,0,0,.28);padding:20px}
     .modal h3{margin:0 0 15px;font-size:20px}
     .modal-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:16px}
+    .edit-lock-modal{text-align:center;padding:26px 24px 22px}
+    .edit-lock-modal .lock-icon{width:58px;height:58px;border-radius:20px;background:#fff1f2;color:#be123c;display:flex;align-items:center;justify-content:center;margin:0 auto 14px;font-size:28px;font-weight:900}
+    .edit-lock-modal p{margin:0;color:#596274;line-height:1.7;font-size:13px}
+    .edit-lock-modal strong{color:#be123c}
     .lightbox{position:fixed;inset:0;background:rgba(4,6,10,.9);display:none;align-items:center;justify-content:center;padding:54px;z-index:110;cursor:zoom-out}
     .lightbox.show{display:flex}
     .lightbox img{max-width:95vw;max-height:88vh;object-fit:contain;border-radius:10px;box-shadow:0 30px 100px rgba(0,0,0,.55);cursor:default}
@@ -307,6 +311,17 @@
       <div class="modal-actions">
         <button class="btn" id="cancelProject">取消</button>
         <button class="btn primary" id="confirmProject">创建项目</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="editLockModal">
+    <div class="modal edit-lock-modal">
+      <div class="lock-icon">!</div>
+      <h3>项目正在被编辑</h3>
+      <p id="editLockModalText">当前项目已被其他成员或窗口打开并获得编辑权限。你现在只能查看，不能输入、上传、删除或保存。</p>
+      <div class="modal-actions" style="justify-content:center">
+        <button class="btn primary" id="closeEditLockModal">知道了</button>
       </div>
     </div>
   </div>
@@ -427,25 +442,29 @@
   }
 
   function ensureClientId(){
-    if(realtimeClientId)return realtimeClientId;
-    try{realtimeClientId=localStorage.getItem('pdp_client_id')||''}catch(e){}
-    if(!realtimeClientId){
-      realtimeClientId=uid();
-      try{localStorage.setItem('pdp_client_id',realtimeClientId)}catch(e){}
-    }
+    // 每个页面窗口独立生成一个编辑身份。
+    // 不写入 localStorage，避免同一账号在多个窗口/多台设备打开同一项目时共用同一个锁。
+    if(!realtimeClientId)realtimeClientId=uid();
     return realtimeClientId;
   }
   function isLockActive(lock){return !!(lock&&lock.expiresAt&&new Date(lock.expiresAt).getTime()>Date.now())}
   function canEditProject(projectId){
     if(!cloudUser)return true;
-    const lock=projectId===state?.selectedProjectId?currentProjectLock:projectLocks[projectId];
-    if(!lock||lock.status==='checking')return false;
+    if(state?.view==='workspace'&&projectId===state?.selectedProjectId){
+      const lock=currentProjectLock;
+      if(!lock||lock.status==='checking')return false;
+      return !!lock.canEdit;
+    }
+    const lock=projectLocks[projectId];
+    // 项目列表里没有锁记录，表示当前项目无人编辑，可编辑。
+    if(!lock)return true;
+    if(lock.status==='checking')return false;
     return !!lock.canEdit;
   }
   function editStatusHtml(projectId){
     const lock=projectLocks[projectId];
     if(!cloudUser)return '<span class="edit-badge ok">可编辑</span>';
-    if(!lock)return '<span class="edit-badge checking">检查中</span>';
+    if(!lock)return '<span class="edit-badge ok">可编辑</span>';
     if(lock.canEdit)return '<span class="edit-badge ok">可编辑</span>';
     const who=lock.lockedByEmail||lock.lockedByName||'其他成员';
     return `<span class="edit-badge locked" title="正在由 ${esc(who)} 编辑">无法编辑</span>`;
@@ -531,6 +550,28 @@
       if(btn.id==='backProjects')return;
       btn.disabled=readOnly;
     });
+    bindWorkspaceHardReadOnlyGuard();
+  }
+
+
+  function isWorkspaceReadOnly(){
+    const p=getProject();
+    return !!(cloudUser&&p&&!canEditProject(p.id));
+  }
+  function bindWorkspaceHardReadOnlyGuard(){
+    const root=$('#workspaceShell');
+    if(!root||root.dataset.guardBound==='1')return;
+    root.dataset.guardBound='1';
+    const isEditTarget=target=>!!target.closest?.('input:not([type="file"]), textarea, [contenteditable="true"], [data-action], [data-image-action], #saveNow, #addSection, #clearBulkPrompt, #applyBulkPrompt, #deleteCurrentProject, #duplicateProject');
+    const guard=e=>{
+      if(!isWorkspaceReadOnly())return;
+      if(e.target.closest?.('#backProjects,.lightbox,.lightbox *'))return;
+      if(!isEditTarget(e.target))return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      showEditLockModal();
+    };
+    ['pointerdown','mousedown','focusin','beforeinput','input','change','paste','drop','keydown','click'].forEach(type=>root.addEventListener(type,guard,true));
   }
 
   function realtimeBadgeHtml(){
@@ -684,10 +725,10 @@
     applyRealtimeLocks();
   }
   function applyRealtimeLocks(){
+    // 只处理协作提示样式，绝不修改 readOnly。项目编辑锁的只读状态只能由 updateProjectEditMode 控制。
     $$('[data-realtime-key]').forEach(el=>{
       el.classList.remove('remote-locked');
       el.title='';
-      if(el.readOnly)el.readOnly=false;
     });
   }
 
@@ -879,12 +920,20 @@ ${copy}`;
           }
         }catch(e){console.warn('读取最新云端状态失败，继续保存当前内容',e)}
         const selectedProject=state.view==='workspace'?getProject():null;
-        const saved=await apiFetch('/api/state',{method:'PUT',body:{state:outbound,clientId:ensureClientId(),projectId:selectedProject&&canEditProject(selectedProject.id)?selectedProject.id:''}});
+        const saved=await apiFetch('/api/state',{method:'PUT',body:{state:outbound,clientId:ensureClientId(),projectId:selectedProject?selectedProject.id:''}});
         cloudStateUpdatedAt=saved?.updatedAt||cloudStateUpdatedAt;
         if(thisSave===saveGeneration)localDirty=false;
         updateSaveStatus();queueRealtimeBroadcast();
       }
-      catch(e){console.warn('云端同步失败',e);if(show)toast('本地已保存，云端同步失败')}
+      catch(e){
+        console.warn('云端同步失败',e);
+        if(e.status===423){
+          toast(e.message||'当前项目无法编辑，云端已拒绝保存');
+          try{const latest=await apiFetch('/api/state');if(latest?.state){state=migrateState(latest.state);cloudStateUpdatedAt=latest.updatedAt||cloudStateUpdatedAt;await dbSet(workspaceStateKey(),state);render();}}catch(_){}
+        }else if(show){
+          toast('本地已保存，云端同步失败');
+        }
+      }
     }else{
       localDirty=false;
     }
@@ -984,7 +1033,11 @@ ${copy}`;
       const action=e.target.closest('[data-action]')?.dataset.action;
       if(action==='new-project')showProjectModal();
       const card=e.target.closest('.project-card');if(!card)return;
-      if(action==='delete-project'){e.stopPropagation();deleteProject(card.dataset.projectId);return}
+      if(action==='delete-project'){
+        e.stopPropagation();
+        if(cloudUser&&!canEditProject(card.dataset.projectId))return showEditLockModal('项目正在被编辑，暂时不能删除。');
+        deleteProject(card.dataset.projectId);return;
+      }
       if(action==='open-project'){openProject(card.dataset.projectId)}
     };
   }
@@ -1004,7 +1057,7 @@ ${copy}`;
     const readonly=cloudUser&&!canEditProject(p.id);
     $('#root').innerHTML=`
       <div id="workspaceShell" class="${readonly?'workspace-readonly':''}">
-      ${readonly?'<div class="readonly-mask">当前项目无法编辑，你正在查看锁定版本。</div>':''}
+      ${readonly?'<div class="readonly-mask">当前项目正在被编辑，你正在查看锁定版本。</div>':''}
       <div class="workspace-header">
         <div>
           <div class="back-link" id="backProjects">← 返回项目列表</div>
@@ -1099,18 +1152,18 @@ ${copy}`;
   function bindWorkspaceEvents(){
     bindCloudButtons();
     const p=getProject();
-    const blocked=()=>cloudUser&&p&&!canEditProject(p.id);
+    const blocked=(show=true)=>{const value=!!(cloudUser&&p&&!canEditProject(p.id));if(value&&show)showEditLockModal();return value};
     $('#backProjects').onclick=async()=>{await releaseProjectLock(p.id);state.view='projects';render()};
     $('#projectName').addEventListener('input',e=>{if(blocked())return;p.name=e.target.value;touch()});
     $('#projectBrief').addEventListener('input',e=>{if(blocked())return;p.brief=e.target.value;touch()});
     $('#bulkPromptText').addEventListener('input',e=>{if(blocked())return;p.bulkPrompt=e.target.value;touch()});
-    $('#clearBulkPrompt').onclick=()=>{if(blocked())return toast('当前项目无法编辑');p.bulkPrompt='';$('#bulkPromptText').value='';touch();toast('批量内容已清空')};
-    $('#applyBulkPrompt').onclick=()=>{if(blocked())return toast('当前项目无法编辑');applyBulkPrompt(p)};
+    $('#clearBulkPrompt').onclick=()=>{if(blocked())return;p.bulkPrompt='';$('#bulkPromptText').value='';touch();toast('批量内容已清空')};
+    $('#applyBulkPrompt').onclick=()=>{if(blocked())return;applyBulkPrompt(p)};
     $('#saveNow').onclick=()=>saveState(true);
-    $('#duplicateProject').onclick=duplicateProject;
-    $('#deleteCurrentProject').onclick=()=>{if(blocked())return toast('当前项目无法编辑');deleteProject(p.id)};
-    $('#addSection').onclick=()=>{if(blocked())return toast('当前项目无法编辑');addSection()};
-    $$('.tab').forEach(btn=>btn.onclick=()=>{state.activeTab=btn.dataset.tab;scheduleSave();renderWorkspace()});
+    $('#duplicateProject').onclick=()=>{if(blocked())return;duplicateProject()};
+    $('#deleteCurrentProject').onclick=()=>{if(blocked())return;deleteProject(p.id)};
+    $('#addSection').onclick=()=>{if(blocked())return;addSection()};
+    $$('.tab').forEach(btn=>btn.onclick=()=>{state.activeTab=btn.dataset.tab;if(!blocked(false))scheduleSave();renderWorkspace()});
 
     $$('.section').forEach(el=>{
       const s=findSection(el.dataset.sectionId);
@@ -1139,8 +1192,8 @@ ${copy}`;
         const action=e.target.closest('[data-action]')?.dataset.action;
         const promptItem=e.target.closest('.prompt-item');
         const prompt=promptItem?s.prompts.find(p=>p.id===promptItem.dataset.promptId):null;
+        if(blocked()&&action&&action!=='copy-prompt')return;
         if(action==='delete-section')deleteSection(s.id);
-        if(blocked()&&action)return toast('当前项目无法编辑');
         if(action==='apply-size-current-demand')applySizeToCurrentDemand(s);
         if(action==='copy-prompt')copyText(buildAllPrompts(s));
         if(action==='add-prompt'){s.prompts.push(createPrompt());s.updatedAt=nowISO();scheduleSave();renderWorkspace();toast('已增加一条提示词')}
@@ -1188,7 +1241,7 @@ ${copy}`;
   }
 
   function setActiveImageTarget(scope,ownerId,field,box){
-    if(cloudUser&&state.view==='workspace'&&!canEditProject(state.selectedProjectId))return;
+    if(cloudUser&&state.view==='workspace'&&!canEditProject(state.selectedProjectId)){showEditLockModal();return;}
     activeImageTarget={scope,ownerId,field};$$('.image-box').forEach(x=>x.classList.remove('active'));box.classList.add('active');
   }
   function getImageOwner(scope,ownerId){return scope==='project'?getProject(ownerId):findSection(ownerId)}
@@ -1207,18 +1260,18 @@ ${copy}`;
     if(gallery.length)openLightbox(gallery,index);
   }
   async function clearImages(scope,ownerId,field){
-    if(cloudUser&&state.view==='workspace'&&!canEditProject(state.selectedProjectId))return toast('当前项目无法编辑');
+    if(cloudUser&&state.view==='workspace'&&!canEditProject(state.selectedProjectId))return showEditLockModal();
     const owner=getImageOwner(scope,ownerId);if(!owner)return;
     if(!confirm('确定清空这个区域的全部图片吗？'))return;
     owner[field]=[];await saveState();renderWorkspace();toast('图片已清空');
   }
   async function removeImage(scope,ownerId,field,imageId){
-    if(cloudUser&&state.view==='workspace'&&!canEditProject(state.selectedProjectId))return toast('当前项目无法编辑');
+    if(cloudUser&&state.view==='workspace'&&!canEditProject(state.selectedProjectId))return showEditLockModal();
     const owner=getImageOwner(scope,ownerId);if(!owner)return;
     owner[field]=(owner[field]||[]).filter(img=>img.id!==imageId);await saveState();renderWorkspace();toast('图片已删除');
   }
   async function addImages(scope,ownerId,field,files){
-    if(cloudUser&&state.view==='workspace'&&!canEditProject(state.selectedProjectId))return toast('当前项目无法编辑');
+    if(cloudUser&&state.view==='workspace'&&!canEditProject(state.selectedProjectId))return showEditLockModal();
     const owner=getImageOwner(scope,ownerId);if(!owner)return;
     toast('正在处理图片……');let compressed=0,failed=0;
     owner[field]=Array.isArray(owner[field])?owner[field]:[];
@@ -1297,7 +1350,14 @@ ${copy}`;
     if(state.activeTab==='main')p.mainSections=p.mainSections.filter(s=>s.id!==id);else p.aplusSections=p.aplusSections.filter(s=>s.id!==id);
     scheduleSave();renderWorkspace();toast('板块已删除');
   }
-  function openProject(id){state.selectedProjectId=id;state.view='workspace';scheduleSave();render()}
+  async function openProject(id){
+    if(state.view==='workspace'&&state.selectedProjectId&&state.selectedProjectId!==id){
+      await releaseProjectLock(state.selectedProjectId);
+    }
+    state.selectedProjectId=id;
+    state.view='workspace';
+    render();
+  }
   function duplicateProject(){
     const p=getProject(),clone=JSON.parse(JSON.stringify(p));clone.id=uid();clone.name=`${p.name}｜副本`;clone.createdAt=nowISO();clone.updatedAt=nowISO();
     const refresh=s=>({...s,id:uid(),referenceImages:[...s.referenceImages],materialImages:[...s.materialImages],prompts:(s.prompts||[]).map(prompt=>({...prompt,id:uid()}))});
@@ -1328,6 +1388,18 @@ ${copy}`;
     try{await navigator.clipboard.writeText(text||'');toast('提示词已复制')}catch(e){const ta=document.createElement('textarea');ta.value=text||'';document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();toast('提示词已复制')}
   }
   function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._timer);t._timer=setTimeout(()=>t.classList.remove('show'),2200)}
+  function showEditLockModal(message){
+    const modal=$('#editLockModal');
+    if(!modal)return toast(message||'项目正在被编辑');
+    const p=getProject();
+    const lock=currentProjectLock||projectLocks[p?.id];
+    const who=lock?.lockedByEmail||lock?.lockedByName||'其他成员或窗口';
+    $('#editLockModalText').innerHTML=message?esc(message):`当前项目正在由 <strong>${esc(who)}</strong> 编辑。你现在只能查看，不能输入、上传、删除或保存。等编辑者返回项目列表或关闭项目后，你就可以重新进入编辑。`;
+    modal.classList.add('show');
+    clearTimeout(modal._timer);
+    modal._timer=setTimeout(()=>modal.classList.remove('show'),2600);
+  }
+  function hideEditLockModal(){$('#editLockModal')?.classList.remove('show')}
   function updateSaveStatus(){const p=getProject(),el=$('#saveStatus');if(p&&el)el.textContent=`${cloudUser?'云端同步：':'更新：'}${formatTime(p.updatedAt)}`}
 
   function openLightbox(gallery,startIndex=0){
@@ -1383,12 +1455,12 @@ ${copy}`;
 
   document.addEventListener('paste',async e=>{
     if(!activeImageTarget||state.view!=='workspace')return;
-    if(cloudUser&&!canEditProject(state.selectedProjectId))return;
+    if(cloudUser&&!canEditProject(state.selectedProjectId)){showEditLockModal();return;}
     const files=Array.from(e.clipboardData?.items||[]).filter(i=>i.type.startsWith('image/')).map(i=>i.getAsFile()).filter(Boolean);
     if(files.length){e.preventDefault();await addImages(activeImageTarget.scope,activeImageTarget.ownerId,activeImageTarget.field,files)}
   });
   $('#navProjects').onclick=async()=>{await releaseProjectLock(state.selectedProjectId);state.view='projects';render()};
-  $('#navCurrent').onclick=()=>{if(getProject()){state.view='workspace';scheduleSave();render()}else toast('暂无项目')};
+  $('#navCurrent').onclick=()=>{if(getProject()){openProject(state.selectedProjectId||getProject().id)}else toast('暂无项目')};
   $('#sideAddProject').onclick=showProjectModal;
   $('#sideExport').onclick=exportData;
   $('#sideImport').onclick=()=>$('#importFile').click();
@@ -1397,6 +1469,8 @@ ${copy}`;
   $('#confirmProject').onclick=createProjectFromModal;
   $('#newProjectName').onkeydown=e=>{if(e.key==='Enter')createProjectFromModal()};
   $('#projectModal').onclick=e=>{if(e.target.id==='projectModal')hideProjectModal()};
+  $('#closeEditLockModal').onclick=hideEditLockModal;
+  $('#editLockModal').onclick=e=>{if(e.target.id==='editLockModal')hideEditLockModal()};
   $('#lightboxClose').onclick=closeLightbox;
   $('#lightboxPrev').onclick=e=>{e.stopPropagation();moveLightbox(-1)};
   $('#lightboxNext').onclick=e=>{e.stopPropagation();moveLightbox(1)};
@@ -1405,7 +1479,7 @@ ${copy}`;
     const lightboxOpen=$('#lightbox').classList.contains('show');
     if(lightboxOpen&&e.key==='ArrowLeft'){e.preventDefault();moveLightbox(-1)}
     if(lightboxOpen&&e.key==='ArrowRight'){e.preventDefault();moveLightbox(1)}
-    if(e.key==='Escape'){closeLightbox();hideProjectModal()}
+    if(e.key==='Escape'){closeLightbox();hideProjectModal();hideEditLockModal()}
   });
   window.addEventListener('beforeunload',()=>{releaseProjectLock(state?.selectedProjectId,true);sendRealtime({type:'editing:end'});if(saveTimer&&currentProjectLock?.canEdit)saveState(false)});
 
