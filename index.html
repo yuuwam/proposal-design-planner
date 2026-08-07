@@ -81,6 +81,7 @@
     .project-card-title{font-weight:850;font-size:16px;line-height:1.4;margin:0 34px 7px 0;word-break:break-word;color:#171b24;cursor:pointer}
     .project-card-title:hover{color:#a65f00}
     .project-meta{font-size:12px;color:#778195;display:flex;gap:10px;flex-wrap:wrap}
+    .team-badge{display:inline-flex;align-items:center;border-radius:999px;padding:4px 8px;background:#eef2ff;border:1px solid #c7d2fe;color:#3730a3;font-size:11px;font-weight:900;white-space:nowrap}
     .edit-badge{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:4px 8px;font-size:11px;font-weight:900;white-space:nowrap;border:1px solid transparent}
     .edit-badge.ok{background:#ecfdf3;border-color:#bbf7d0;color:#166534}
     .edit-badge.locked{background:#fff1f2;border-color:#fecdd3;color:#be123c}
@@ -185,6 +186,16 @@
     .bulk-prompt-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:end}
     .bulk-prompt-text{min-height:100px}
     .bulk-prompt-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+    .competitor-links-panel{margin-top:14px;border-top:1px dashed #dde3ec;padding-top:14px}
+    .competitor-links-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+    .competitor-links-head h4{margin:0;font-size:14px;color:#242b38}
+    .competitor-links-list{display:flex;flex-direction:column;gap:9px}
+    .competitor-link-row{display:grid;grid-template-columns:140px minmax(0,1fr) auto auto;gap:8px;align-items:center}
+    .competitor-link-row input{height:38px;border:1px solid #dfe5ef;border-radius:11px;background:#fff;padding:0 11px;color:#171b24;outline:0}
+    .competitor-link-row input:focus{border-color:var(--brand);box-shadow:0 0 0 4px rgba(255,184,77,.14)}
+    .competitor-link-row .link-open-btn{min-width:82px}
+    .competitor-link-row .link-delete-btn{min-width:58px}
+    @media(max-width:650px){.competitor-link-row{grid-template-columns:1fr}.competitor-link-row .btn{width:100%}}
     .mobile-warning{display:none}
     .toast{position:fixed;right:24px;bottom:24px;background:#151923;color:#fff;padding:12px 15px;border-radius:13px;box-shadow:0 18px 55px rgba(0,0,0,.3);opacity:0;transform:translateY(12px);pointer-events:none;transition:.2s;z-index:100;font-size:12px;max-width:390px}
     .toast.show{opacity:1;transform:translateY(0)}
@@ -341,6 +352,7 @@
   const STATE_KEY = 'proposal-planner-state-v2';
   const MAX_IMAGE_BYTES = 1024 * 1024;
   const PROMPT_MARKER = '—— 自定义提示词 ——';
+  const ADMIN_EMAIL = 'administrator@test.com';
 
   const defaultMainTitles = [
     '主图 01｜白底产品主图','主图 02｜核心卖点图','主图 03｜功能结构图',
@@ -396,6 +408,11 @@
     if(!res.ok){const err=new Error(data?.message||`请求失败：${res.status}`);err.status=res.status;throw err}
     return data;
   }
+  function isAdmin(){return !!(cloudUser&&(cloudUser.isAdmin||String(cloudUser.email||'').toLowerCase()===ADMIN_EMAIL))}
+  function projectWorkspaceId(projectOrId){
+    const p=typeof projectOrId==='object'?projectOrId:getProject(projectOrId);
+    return p?._workspaceId||cloudWorkspace?.id||'';
+  }
   function cloudBadge(theme='dark'){
     if(!cloudUser)return '';
     const name=cloudWorkspace?.name||'云端团队';
@@ -409,7 +426,7 @@
     const team=cloudWorkspace?.name||'当前团队';
     const invite=cloudWorkspace?.inviteCode?` · 团队码 ${cloudWorkspace.inviteCode}`:'';
     el.classList.remove('hidden');
-    el.innerHTML=`<div class="account-label">当前登录账号</div><div class="account-mail">${esc(cloudUser.email)}</div><div class="account-team">${esc(team+invite)}</div>`;
+    el.innerHTML=`<div class="account-label">当前登录账号${isAdmin()?' · 管理员':''}</div><div class="account-mail">${esc(cloudUser.email)}</div><div class="account-team">${esc(isAdmin()?'全部团队项目':team+invite)}</div>`;
   }
   function findRealtimeEl(key){return $$('[data-realtime-key]').find(el=>el.dataset.realtimeKey===key)||null}
   function applyValueByRealtimeKey(targetState,key,value){
@@ -435,9 +452,9 @@
     try{const data=await apiFetch('/api/me');cloudUser=data.user;cloudWorkspace=data.workspace;cloudApiReady=true;cloudApiError='';return true}
     catch(e){cloudUser=null;cloudWorkspace=null;cloudApiReady=e.status===401;cloudApiError=e.status===401?'':(e.message||'云端接口未连接，请检查 Pages Functions 和 DB 绑定');return false}
   }
-  async function uploadImageToCloud(dataUrl,name){
+  async function uploadImageToCloud(dataUrl,name,workspaceId=''){
     if(!cloudUser||!cloudApiReady)return null;
-    return apiFetch('/api/images',{method:'POST',body:{dataUrl,name}});
+    return apiFetch('/api/images',{method:'POST',body:{dataUrl,name,workspaceId}});
   }
 
   function ensureClientId(){
@@ -497,7 +514,7 @@
     projectLocks[projectId]=currentProjectLock;
     updateProjectEditMode();
     try{
-      const data=await apiFetch('/api/project-locks/acquire',{method:'POST',body:{projectId,clientId:realtimeClientId}});
+      const data=await apiFetch('/api/project-locks/acquire',{method:'POST',body:{projectId,clientId:realtimeClientId,workspaceId:projectWorkspaceId(projectId)}});
       currentProjectLock=data.lock||{projectId,canEdit:!!data.canEdit};
       projectLocks[projectId]=currentProjectLock;
       updateProjectEditMode();
@@ -509,7 +526,7 @@
     const p=getProject();
     if(!p||!cloudUser||!currentProjectLock?.canEdit)return;
     try{
-      const data=await apiFetch('/api/project-locks/heartbeat',{method:'POST',body:{projectId:p.id,clientId:ensureClientId()}});
+      const data=await apiFetch('/api/project-locks/heartbeat',{method:'POST',body:{projectId:p.id,clientId:ensureClientId(),workspaceId:projectWorkspaceId(p)}});
       currentProjectLock=data.lock||currentProjectLock;
       projectLocks[p.id]=currentProjectLock;
       updateProjectEditMode();
@@ -522,12 +539,12 @@
   async function releaseProjectLock(projectId,stateOnly=false){
     const idToRelease=projectId||currentProjectLock?.projectId||realtimeProjectId||state?.selectedProjectId;
     if(!idToRelease||!cloudUser||!cloudApiReady||!realtimeClientId)return;
-    const body=JSON.stringify({projectId:idToRelease,clientId:realtimeClientId});
+    const body=JSON.stringify({projectId:idToRelease,clientId:realtimeClientId,workspaceId:projectWorkspaceId(idToRelease)});
     try{
       if(stateOnly&&navigator.sendBeacon){
         navigator.sendBeacon('/api/project-locks/release',new Blob([body],{type:'application/json'}));
       }else{
-        await apiFetch('/api/project-locks/release',{method:'POST',body:{projectId:idToRelease,clientId:realtimeClientId}});
+        await apiFetch('/api/project-locks/release',{method:'POST',body:{projectId:idToRelease,clientId:realtimeClientId,workspaceId:projectWorkspaceId(idToRelease)}});
       }
     }catch(e){}
     if(currentProjectLock?.projectId===idToRelease)currentProjectLock=null;
@@ -671,6 +688,7 @@
       ...remoteProject,
       ...(topLocal?{name:localProject.name,brief:localProject.brief,bulkPrompt:localProject.bulkPrompt}:{}),
       productImages:mergeImageArrays(remoteProject.productImages,localProject.productImages),
+      competitorLinks:topLocal?migrateCompetitorLinks(localProject.competitorLinks):migrateCompetitorLinks(remoteProject.competitorLinks),
       mainSections:mergeSections(remoteProject.mainSections,localProject.mainSections),
       aplusSections:mergeSections(remoteProject.aplusSections,localProject.aplusSections),
       updatedAt:maxTime(remoteProject.updatedAt,localProject.updatedAt),
@@ -739,9 +757,27 @@
       prompts:[createPrompt()], updatedAt:nowISO()
     };
   }
+  function defaultCompetitorLinks(){
+    const t=nowISO();
+    return [
+      {id:uid(),label:'类目链接',url:'',createdAt:t,updatedAt:t},
+      {id:uid(),label:'竞品链接 1',url:'',createdAt:t,updatedAt:t},
+      {id:uid(),label:'竞品链接 2',url:'',createdAt:t,updatedAt:t}
+    ];
+  }
+  function migrateCompetitorLinks(links){
+    if(!Array.isArray(links)||!links.length)return defaultCompetitorLinks();
+    return links.map((link,index)=>({
+      id:link?.id||uid(),
+      label:String(link?.label||link?.name||(['类目链接','竞品链接 1','竞品链接 2'][index]||`竞品链接 ${index+1}`)),
+      url:String(link?.url||link?.href||''),
+      createdAt:link?.createdAt||nowISO(),
+      updatedAt:link?.updatedAt||nowISO()
+    }));
+  }
   function createProject(name='未命名项目'){
     return {
-      id:uid(), name, brief:'', productImages:[], bulkPrompt:'', createdAt:nowISO(), updatedAt:nowISO(),
+      id:uid(), name, brief:'', productImages:[], competitorLinks:defaultCompetitorLinks(), bulkPrompt:'', createdAt:nowISO(), updatedAt:nowISO(),
       mainSections:defaultMainTitles.map(t=>createSection(t,'main')),
       aplusSections:defaultAplusTitles.map(t=>createSection(t,'aplus'))
     };
@@ -788,7 +824,8 @@
     const p=project||{};
     return {
       id:p.id||uid(), name:p.name||'未命名项目', brief:p.brief||'',
-      productImages:Array.isArray(p.productImages)?p.productImages:[], bulkPrompt:p.bulkPrompt||'',
+      _workspaceId:p._workspaceId||'', _workspaceName:p._workspaceName||'', _workspaceInviteCode:p._workspaceInviteCode||'',
+      productImages:Array.isArray(p.productImages)?p.productImages:[], competitorLinks:migrateCompetitorLinks(p.competitorLinks), bulkPrompt:p.bulkPrompt||'',
       createdAt:p.createdAt||nowISO(), updatedAt:p.updatedAt||nowISO(),
       mainSections:(Array.isArray(p.mainSections)?p.mainSections:defaultMainTitles.map(t=>createSection(t,'main'))).map(s=>migrateSection(s,'main')),
       aplusSections:(Array.isArray(p.aplusSections)?p.aplusSections:defaultAplusTitles.map(t=>createSection(t,'aplus'))).map(s=>migrateSection(s,'aplus'))
@@ -802,6 +839,7 @@
       view:raw.view==='workspace'?'workspace':'projects',
       selectedProjectId:projects.some(p=>p.id===raw.selectedProjectId)?raw.selectedProjectId:(projects[0]?.id||''),
       activeTab:raw.activeTab==='aplus'?'aplus':'main',
+      adminWorkspaceIds:Array.isArray(raw.adminWorkspaceIds)?raw.adminWorkspaceIds:undefined,
       projects
     };
   }
@@ -919,7 +957,7 @@ ${copy}`;
           }
         }catch(e){console.warn('读取最新云端状态失败，继续保存当前内容',e)}
         const selectedProject=state.view==='workspace'?getProject():null;
-        const saved=await apiFetch('/api/state',{method:'PUT',body:{state:outbound,clientId:ensureClientId(),projectId:selectedProject?selectedProject.id:''}});
+        const saved=await apiFetch('/api/state',{method:'PUT',body:{state:outbound,clientId:ensureClientId(),projectId:selectedProject?selectedProject.id:'',projectWorkspaceId:selectedProject?projectWorkspaceId(selectedProject):''}});
         cloudStateUpdatedAt=saved?.updatedAt||cloudStateUpdatedAt;
         if(thisSave===saveGeneration)localDirty=false;
         updateSaveStatus();queueRealtimeBroadcast();
@@ -1022,7 +1060,7 @@ ${copy}`;
         <button class="card-delete" data-action="delete-project" title="删除项目">×</button>
         <div class="project-body">
           <h3 class="project-card-title" data-action="open-project">${esc(p.name)}</h3>
-          <div class="project-meta"><span>主图 ${p.mainSections.length}</span><span>详情页 ${p.aplusSections.length}</span><span>产品图 ${p.productImages.length}</span>${editStatusHtml(p.id)}</div>
+          <div class="project-meta">${isAdmin()&&p._workspaceName?`<span class="team-badge">${esc(p._workspaceName)}</span>`:''}<span>主图 ${p.mainSections.length}</span><span>详情页 ${p.aplusSections.length}</span><span>产品图 ${p.productImages.length}</span>${editStatusHtml(p.id)}</div>
           <div class="project-card-footer"><span class="updated">更新：${formatTime(p.updatedAt)}</span><button class="btn small" data-action="open-project">打开项目 →</button></div>
         </div>
       </article>`;
@@ -1074,6 +1112,7 @@ ${copy}`;
         <section class="panel">
           <div class="panel-title"><h3>项目总策划</h3><span class="hint">产品定位、目标人群、核心卖点、视觉方向</span></div>
           <textarea class="brief-textarea" id="projectBrief" placeholder="填写项目整体策划……" ${realtimeField(`project:${p.id}:brief`,`项目总策划`)}>${esc(p.brief)}</textarea>
+          ${renderCompetitorLinks(p)}
         </section>
         <section class="panel">
           <div class="panel-title"><h3>项目概览</h3></div>
@@ -1083,13 +1122,13 @@ ${copy}`;
       <section class="panel product-panel">
         ${renderImageBox({id:p.id,productImages:p.productImages},'productImages','产品图片','上传产品实拍、白底图、角度图或细节图；支持上传、拖拽和粘贴。','project')}
       </section>
-      <section class="panel bulk-prompt-panel">
+      ${isAdmin()?`<section class="panel bulk-prompt-panel">
         <div class="panel-title"><div><h3>批量更新提示词</h3><div class="hint">填写公共要求后，一键追加到当前项目每个主图与详情页 板块的全部提示词末尾。</div></div></div>
         <div class="bulk-prompt-row">
           <textarea class="bulk-prompt-text" id="bulkPromptText" placeholder="例如：产品外观严格保持不变，电影级灯光，高端商业广告风格，超清晰细节……" ${realtimeField(`project:${p.id}:bulkPrompt`,`批量更新提示词`)}>${esc(p.bulkPrompt||'')}</textarea>
           <div class="bulk-prompt-actions"><button class="btn" id="clearBulkPrompt">清空内容</button><button class="btn primary" id="applyBulkPrompt">批量修改</button></div>
         </div>
-      </section>
+      </section>`:''}
       <div class="tabs-wrap">
         <div class="tabs">
           <div class="tab-buttons"><button class="tab ${state.activeTab==='main'?'active':''}" data-tab="main">主图需求</button><button class="tab ${state.activeTab==='aplus'?'active':''}" data-tab="aplus">详情页需求</button></div>
@@ -1104,13 +1143,29 @@ ${copy}`;
     updateProjectEditMode();
   }
 
+  function renderCompetitorLinks(project){
+    const links=migrateCompetitorLinks(project.competitorLinks);
+    project.competitorLinks=links;
+    return `<div class="competitor-links-panel" id="competitorLinksPanel">
+      <div class="competitor-links-head"><div><h4>竞品链接</h4><div class="hint">默认包含 1 个类目链接和 2 个竞品链接，可继续增加。</div></div><button class="btn small primary" type="button" data-action="add-competitor-link">＋ 增加链接</button></div>
+      <div class="competitor-links-list">
+        ${links.map(link=>`<div class="competitor-link-row" data-link-id="${esc(link.id)}">
+          <input class="link-label" data-link-field="label" value="${esc(link.label)}" placeholder="链接名称" />
+          <input class="link-url" data-link-field="url" value="${esc(link.url)}" placeholder="粘贴类目或竞品链接" />
+          <button class="btn small dark link-open-btn" type="button" data-link-open="${esc(link.id)}">打开链接</button>
+          <button class="btn small danger link-delete-btn" type="button" data-action="delete-competitor-link">删除</button>
+        </div>`).join('')}
+      </div>
+    </div>`;
+  }
+
   function renderSection(section,index){
     return `<section class="section" data-section-id="${section.id}">
       <div class="section-head">
         <div class="section-title-wrap"><span class="section-index">${String(index+1).padStart(2,'0')}</span><input class="section-title" data-field="title" value="${esc(section.title)}" ${realtimeField(`section:${section.id}:title`,`板块主题`)} /></div>
         <div class="section-head-right">
           <div class="size-inline ${index===0?'applyable':''}"><label>像素要求 / 尺寸要求</label><input data-field="size" value="${esc(section.size)}" placeholder="例如：2000 × 2000 px / 1:1" ${realtimeField(`section:${section.id}:size`,`像素 / 尺寸要求`)} />${index===0?'<button class="btn small primary size-apply-btn" type="button" data-action="apply-size-current-demand">一键批量应用</button>':''}</div>
-          <div class="section-actions"><button class="btn small" data-action="copy-prompt">复制提示词</button><button class="btn small danger" data-action="delete-section">删除</button></div>
+          <div class="section-actions">${isAdmin()?'<button class="btn small" data-action="copy-prompt">复制提示词</button>':''}<button class="btn small danger" data-action="delete-section">删除</button></div>
         </div>
       </div>
       <div class="section-body">
@@ -1119,12 +1174,12 @@ ${copy}`;
           ${renderImageBox(section,'materialImages','图片素材','场景、配色、质感、包装、图标或局部素材。','section')}
         </div>
         <div class="form-grid">
-          <div class="field full"><div class="field-label"><span>文案 <span class="hint">内容会自动同步到 AI 提示词</span></span><button class="btn small" type="button" data-action="append-copy-to-prompt">一键填入提示词</button></div><textarea class="copy" data-field="copy" placeholder="标题、副标题、标签、卖点文案……" ${realtimeField(`section:${section.id}:copy`,`文案`)}>${esc(section.copy)}</textarea></div>
+          <div class="field full"><div class="field-label"><span>文案 <span class="hint">${isAdmin()?'内容会自动同步到 AI 提示词':'填写标题、副标题、标签、卖点文案'}</span></span>${isAdmin()?'<button class="btn small" type="button" data-action="append-copy-to-prompt">一键填入提示词</button>':''}</div><textarea class="copy" data-field="copy" placeholder="标题、副标题、标签、卖点文案……" ${realtimeField(`section:${section.id}:copy`,`文案`)}>${esc(section.copy)}</textarea></div>
           <div class="field full"><div class="field-label">场景描述 / 图片要求</div><textarea class="scene" data-field="scene" placeholder="场景、构图、产品角度、人物、道具、光线等要求……" ${realtimeField(`section:${section.id}:scene`,`场景描述 / 图片要求`)}>${esc(section.scene)}</textarea></div>
-          <div class="field full">
+          ${isAdmin()?`<div class="field full">
             <div class="field-label"><span>AI 提示词 <span class="sync-note">每条提示词都会自动同步“主题”“比例”和“文案”</span></span><button class="btn small primary" type="button" data-action="add-prompt">＋ 增加提示词</button></div>
             <div class="prompt-list">${section.prompts.length?section.prompts.map((prompt,promptIndex)=>renderPromptItem(section,prompt,promptIndex)).join(''):'<div class="prompt-empty">暂无提示词，点击“增加提示词”创建。</div>'}</div>
-          </div>
+          </div>`:''}
         </div>
       </div>
     </section>`;
@@ -1154,9 +1209,10 @@ ${copy}`;
     $('#backProjects').onclick=async()=>{await releaseProjectLock(p.id);state.view='projects';render()};
     $('#projectName').addEventListener('input',e=>{if(blocked())return;p.name=e.target.value;touch()});
     $('#projectBrief').addEventListener('input',e=>{if(blocked())return;p.brief=e.target.value;touch()});
-    $('#bulkPromptText').addEventListener('input',e=>{if(blocked())return;p.bulkPrompt=e.target.value;touch()});
-    $('#clearBulkPrompt').onclick=()=>{if(blocked())return;p.bulkPrompt='';$('#bulkPromptText').value='';touch();toast('批量内容已清空')};
-    $('#applyBulkPrompt').onclick=()=>{if(blocked())return;applyBulkPrompt(p)};
+    bindCompetitorLinks(p,blocked);
+    const bulkPromptEl=$('#bulkPromptText'); if(bulkPromptEl)bulkPromptEl.addEventListener('input',e=>{if(blocked())return;p.bulkPrompt=e.target.value;touch()});
+    const clearBulkBtn=$('#clearBulkPrompt'); if(clearBulkBtn)clearBulkBtn.onclick=()=>{if(blocked())return;p.bulkPrompt='';const el=$('#bulkPromptText');if(el)el.value='';touch();toast('批量内容已清空')};
+    const applyBulkBtn=$('#applyBulkPrompt'); if(applyBulkBtn)applyBulkBtn.onclick=()=>{if(blocked())return;applyBulkPrompt(p)};
     $('#saveNow').onclick=()=>saveState(true);
     $('#duplicateProject').onclick=()=>{if(blocked())return;duplicateProject()};
     $('#deleteCurrentProject').onclick=()=>{if(blocked())return;deleteProject(p.id)};
@@ -1214,6 +1270,55 @@ ${copy}`;
     bindAllImageBoxes();
     updateProjectEditMode();
     bindRealtimeInputs();
+  }
+
+  function normalizeExternalUrl(url){
+    const value=String(url||'').trim();
+    if(!value)return '';
+    if(/^https?:\/\//i.test(value))return value;
+    return `https://${value}`;
+  }
+  function bindCompetitorLinks(project,blocked){
+    const panel=$('#competitorLinksPanel');if(!panel||!project)return;
+    project.competitorLinks=migrateCompetitorLinks(project.competitorLinks);
+    panel.querySelectorAll('[data-link-field]').forEach(input=>{
+      input.addEventListener('input',()=>{
+        if(blocked())return;
+        const row=input.closest('[data-link-id]');
+        const link=project.competitorLinks.find(item=>item.id===row.dataset.linkId);
+        if(!link)return;
+        link[input.dataset.linkField]=input.value;
+        link.updatedAt=nowISO();
+        touch();
+      });
+    });
+    panel.addEventListener('click',e=>{
+      const openBtn=e.target.closest('[data-link-open]');
+      if(openBtn){
+        const link=project.competitorLinks.find(item=>item.id===openBtn.dataset.linkOpen);
+        const url=normalizeExternalUrl(link?.url);
+        if(!url)return toast('请先填写链接地址');
+        window.open(url,'_blank','noopener,noreferrer');
+        return;
+      }
+      const action=e.target.closest('[data-action]')?.dataset.action;
+      if(!action)return;
+      if(blocked())return;
+      if(action==='add-competitor-link'){
+        const count=(project.competitorLinks||[]).filter(l=>String(l.label||'').includes('竞品链接')).length+1;
+        const t=nowISO();
+        project.competitorLinks.push({id:uid(),label:`竞品链接 ${count}`,url:'',createdAt:t,updatedAt:t});
+        touch();renderWorkspace();toast('已增加链接');
+      }
+      if(action==='delete-competitor-link'){
+        const row=e.target.closest('[data-link-id]');
+        if(!row)return;
+        if(!confirm('确定删除这个链接吗？'))return;
+        project.competitorLinks=project.competitorLinks.filter(item=>item.id!==row.dataset.linkId);
+        if(!project.competitorLinks.length)project.competitorLinks=defaultCompetitorLinks();
+        touch();renderWorkspace();toast('链接已删除');
+      }
+    });
   }
 
   function bindAllImageBoxes(){
@@ -1280,7 +1385,7 @@ ${copy}`;
         if(result.compressed)compressed++;
         let imageRecord={id:uid(),name:file.name||'粘贴图片',dataUrl:result.dataUrl,bytes:result.bytes,originalBytes:file.size||result.bytes,createdAt:nowISO()};
         if(cloudUser&&cloudApiReady){
-          try{const cloud=await uploadImageToCloud(result.dataUrl,imageRecord.name);imageRecord={...imageRecord,dataUrl:cloud.url,objectKey:cloud.key,bytes:cloud.bytes||imageRecord.bytes,storedIn:cloud.storedIn||'d1'}}
+          try{const cloud=await uploadImageToCloud(result.dataUrl,imageRecord.name,projectWorkspaceId(state.selectedProjectId));imageRecord={...imageRecord,dataUrl:cloud.url,objectKey:cloud.key,bytes:cloud.bytes||imageRecord.bytes,storedIn:cloud.storedIn||'d1'}}
           catch(e){console.warn('图片云端上传失败，保留本地编码',e);failed++;continue}
         }
         owner[field].push(imageRecord);
@@ -1358,6 +1463,7 @@ ${copy}`;
   }
   function duplicateProject(){
     const p=getProject(),clone=JSON.parse(JSON.stringify(p));clone.id=uid();clone.name=`${p.name}｜副本`;clone.createdAt=nowISO();clone.updatedAt=nowISO();
+    clone.competitorLinks=migrateCompetitorLinks(clone.competitorLinks).map(link=>({...link,id:uid()}));
     const refresh=s=>({...s,id:uid(),referenceImages:[...s.referenceImages],materialImages:[...s.materialImages],prompts:(s.prompts||[]).map(prompt=>({...prompt,id:uid()}))});
     clone.mainSections=clone.mainSections.map(refresh);clone.aplusSections=clone.aplusSections.map(refresh);
     state.projects.unshift(clone);state.selectedProjectId=clone.id;state.view='workspace';scheduleSave();render();toast('项目已复制');
@@ -1372,7 +1478,7 @@ ${copy}`;
   function showProjectModal(){$('#projectModal').classList.add('show');$('#newProjectName').value='';setTimeout(()=>$('#newProjectName').focus(),20)}
   function hideProjectModal(){$('#projectModal').classList.remove('show')}
   function createProjectFromModal(){
-    const p=createProject($('#newProjectName').value.trim()||'未命名项目');state.projects.unshift(p);state.selectedProjectId=p.id;state.activeTab='main';state.view='workspace';hideProjectModal();scheduleSave();render();toast('项目已创建');
+    const p=createProject($('#newProjectName').value.trim()||'未命名项目');if(isAdmin()){p._workspaceId=cloudWorkspace?.id||'';p._workspaceName=cloudWorkspace?.name||'管理员团队';p._workspaceInviteCode=cloudWorkspace?.inviteCode||'';}state.projects.unshift(p);state.selectedProjectId=p.id;state.activeTab='main';state.view='workspace';hideProjectModal();scheduleSave();render();toast('项目已创建');
   }
 
   function exportData(){

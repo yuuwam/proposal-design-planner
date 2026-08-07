@@ -128,6 +128,8 @@ export default {
 const COOKIE_NAME = 'pdp_session';
 const SESSION_DAYS = 30;
 const ITERATIONS = 100000;
+const ADMIN_EMAIL = 'administrator@test.com';
+const ADMIN_PASSWORD = '123456';
 
 async function handleApi(context) {
   const { request, env } = context;
@@ -207,6 +209,13 @@ async function login(request, env) {
   const body = await readJson(request);
   const email = clean(body.email).toLowerCase();
   const password = String(body.password || '');
+
+  if (isAdminEmail(email) && password === ADMIN_PASSWORD) {
+    const admin = await ensureAdminIdentity(env);
+    const session = await createSession(env, admin.user.id, admin.workspace.id);
+    return json({ user: publicUser(admin.user), workspace: publicWorkspace(admin.workspace) }, 200, sessionCookie(session.token));
+  }
+
   const user = await env.DB.prepare('SELECT * FROM users WHERE lower(email)=lower(?)').bind(email).first();
   if (!user) return json({ message: '邮箱或密码不正确' }, 401);
   const ok = await verifyPassword(password, user.password_salt, user.password_hash);
@@ -215,6 +224,35 @@ async function login(request, env) {
   if (!workspace) return json({ message: '当前账号没有团队空间' }, 403);
   const session = await createSession(env, user.id, workspace.id);
   return json({ user: publicUser(user), workspace: publicWorkspace(workspace) }, 200, sessionCookie(session.token));
+}
+
+
+async function ensureAdminIdentity(env) {
+  const now = new Date().toISOString();
+  let user = await env.DB.prepare('SELECT * FROM users WHERE lower(email)=lower(?)').bind(ADMIN_EMAIL).first();
+  if (!user) {
+    const userId = id('usr');
+    const salt = randomHex(16);
+    const hash = await hashPassword(ADMIN_PASSWORD, salt);
+    await env.DB.prepare('INSERT INTO users (id,name,email,password_salt,password_hash,created_at,updated_at) VALUES (?,?,?,?,?,?,?)')
+      .bind(userId, 'Administrator', ADMIN_EMAIL, salt, hash, now, now).run();
+    user = { id: userId, name: 'Administrator', email: ADMIN_EMAIL, password_salt: salt, password_hash: hash, created_at: now, updated_at: now };
+  }
+  let workspace = await env.DB.prepare('SELECT w.* FROM workspaces w JOIN workspace_users wu ON wu.workspace_id=w.id WHERE wu.user_id=? ORDER BY wu.created_at ASC LIMIT 1')
+    .bind(user.id).first();
+  if (!workspace) {
+    workspace = { id: id('wsp'), name: '管理员工作区', invite_code: 'ADMIN', created_at: now, updated_at: now };
+    try {
+      await env.DB.prepare('INSERT INTO workspaces (id,name,invite_code,created_at,updated_at) VALUES (?,?,?,?,?)')
+        .bind(workspace.id, workspace.name, workspace.invite_code, now, now).run();
+    } catch (err) {
+      workspace = await env.DB.prepare('SELECT * FROM workspaces WHERE invite_code=?').bind('ADMIN').first();
+    }
+    await env.DB.prepare('INSERT OR IGNORE INTO workspace_users (workspace_id,user_id,role,created_at) VALUES (?,?,?,?)')
+      .bind(workspace.id, user.id, 'admin', now).run();
+    await ensureEmptyPlannerState(env, workspace.id, user.id);
+  }
+  return { user, workspace };
 }
 
 async function logout(request, env) {
@@ -305,6 +343,25 @@ async function updatePresence(request, env, session) {
 
 const PROJECT_LOCK_TTL_MS = 10 * 60 * 1000;
 
+
+function isAdminEmail(email) { return String(email || '').toLowerCase() === ADMIN_EMAIL; }
+function isAdminSession(session) { return !!(session?.user?.isAdmin || isAdminEmail(session?.user?.email)); }
+function targetWorkspaceId(session, requestedWorkspaceId) {
+  requestedWorkspaceId = clean(requestedWorkspaceId);
+  return isAdminSession(session) && requestedWorkspaceId ? requestedWorkspaceId : session.workspace.id;
+}
+function cleanProjectForStorage(project) {
+  if (!project || typeof project !== 'object') return project;
+  const copy = JSON.parse(JSON.stringify(project));
+  delete copy._workspaceId;
+  delete copy._workspaceName;
+  delete copy._workspaceInviteCode;
+  return copy;
+}
+function decorateProject(project, workspace) {
+  return { ...project, _workspaceId: workspace.id, _workspaceName: workspace.name, _workspaceInviteCode: workspace.invite_code };
+}
+
 async function ensureProjectLocksTable(env) {
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS project_locks (
     workspace_id TEXT NOT NULL,
@@ -346,7 +403,9 @@ function publicLock(row, clientId) {
 async function listProjectLocks(env, session, url) {
   const clientId = clean(url.searchParams.get('clientId'));
   await cleanupExpiredProjectLocks(env);
-  const rows = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=?').bind(session.workspace.id).all();
+  const rows = isAdminSession(session)
+    ? await env.DB.prepare('SELECT * FROM project_locks').all()
+    : await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=?').bind(session.workspace.id).all();
   const locks = {};
   for (const row of rows.results || []) locks[row.project_id] = publicLock(row, clientId);
   return json({ ok: true, locks, serverTime: new Date().toISOString() });
@@ -356,10 +415,11 @@ async function acquireProjectLock(request, env, session) {
   const body = await readJson(request);
   const projectId = clean(body.projectId);
   const clientId = clean(body.clientId);
+  const workspaceId = targetWorkspaceId(session, body.workspaceId);
   if (!projectId || !clientId) return json({ message: '缺少 projectId 或 clientId' }, 400);
   await cleanupExpiredProjectLocks(env);
   const existing = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=? AND project_id=?')
-    .bind(session.workspace.id, projectId).first();
+    .bind(workspaceId, projectId).first();
   if (existing && String(existing.client_id || '') !== clientId && new Date(existing.expires_at).getTime() > Date.now()) {
     return json({ ok: false, canEdit: false, lock: publicLock(existing, clientId), message: '当前项目正在被其他窗口或成员编辑' });
   }
@@ -368,8 +428,8 @@ async function acquireProjectLock(request, env, session) {
   await env.DB.prepare(`INSERT INTO project_locks (workspace_id,project_id,locked_by_user_id,locked_by_email,locked_by_name,client_id,locked_at,last_seen,expires_at)
     VALUES (?,?,?,?,?,?,?,?,?)
     ON CONFLICT(workspace_id,project_id) DO UPDATE SET locked_by_user_id=excluded.locked_by_user_id,locked_by_email=excluded.locked_by_email,locked_by_name=excluded.locked_by_name,client_id=excluded.client_id,last_seen=excluded.last_seen,expires_at=excluded.expires_at`)
-    .bind(session.workspace.id, projectId, session.user.id, session.user.email || '', session.user.name || '', clientId, existing?.locked_at || now, now, expiresAt).run();
-  const row = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=? AND project_id=?').bind(session.workspace.id, projectId).first();
+    .bind(workspaceId, projectId, session.user.id, session.user.email || '', session.user.name || '', clientId, existing?.locked_at || now, now, expiresAt).run();
+  const row = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=? AND project_id=?').bind(workspaceId, projectId).first();
   return json({ ok: true, canEdit: true, lock: publicLock(row, clientId) });
 }
 
@@ -377,17 +437,18 @@ async function heartbeatProjectLock(request, env, session) {
   const body = await readJson(request);
   const projectId = clean(body.projectId);
   const clientId = clean(body.clientId);
+  const workspaceId = targetWorkspaceId(session, body.workspaceId);
   if (!projectId || !clientId) return json({ message: '缺少 projectId 或 clientId' }, 400);
   await cleanupExpiredProjectLocks(env);
   const row = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=? AND project_id=?')
-    .bind(session.workspace.id, projectId).first();
+    .bind(workspaceId, projectId).first();
   if (!row) return json({ ok: false, canEdit: false, message: '项目编辑锁不存在' });
   if (String(row.client_id || '') !== clientId) return json({ ok: false, canEdit: false, lock: publicLock(row, clientId), message: '当前项目正在被其他窗口或成员编辑' });
   const now = new Date().toISOString();
   const expiresAt = new Date(Date.now() + PROJECT_LOCK_TTL_MS).toISOString();
   await env.DB.prepare('UPDATE project_locks SET last_seen=?,expires_at=? WHERE workspace_id=? AND project_id=? AND client_id=?')
-    .bind(now, expiresAt, session.workspace.id, projectId, clientId).run();
-  const updated = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=? AND project_id=?').bind(session.workspace.id, projectId).first();
+    .bind(now, expiresAt, workspaceId, projectId, clientId).run();
+  const updated = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=? AND project_id=?').bind(workspaceId, projectId).first();
   return json({ ok: true, canEdit: true, lock: publicLock(updated, clientId) });
 }
 
@@ -395,20 +456,22 @@ async function releaseProjectLock(request, env, session) {
   const body = await readJson(request);
   const projectId = clean(body.projectId);
   const clientId = clean(body.clientId);
+  const workspaceId = targetWorkspaceId(session, body.workspaceId);
   if (!projectId || !clientId) return json({ ok: true });
   await ensureProjectLocksTable(env);
   await env.DB.prepare('DELETE FROM project_locks WHERE workspace_id=? AND project_id=? AND client_id=?')
-    .bind(session.workspace.id, projectId, clientId).run();
+    .bind(workspaceId, projectId, clientId).run();
   return json({ ok: true });
 }
 
 async function assertProjectEditable(env, session, projectId, clientId, options = {}) {
   projectId = clean(projectId);
   clientId = clean(clientId);
+  const workspaceId = targetWorkspaceId(session, options.workspaceId);
   if (!projectId) return;
   await cleanupExpiredProjectLocks(env);
   const row = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=? AND project_id=?')
-    .bind(session.workspace.id, projectId).first();
+    .bind(workspaceId, projectId).first();
   const active = row && new Date(row.expires_at).getTime() > Date.now();
   const ownsLock = active && String(row.client_id || '') === String(clientId || '');
   // 服务器端硬限制：凡是修改已有项目，必须持有这个项目的有效编辑锁。
@@ -443,23 +506,42 @@ function changedExistingProjectIds(oldState, newState) {
   return [...changed];
 }
 
-async function assertStateMutationAllowed(env, session, oldState, newState, clientId, hintedProjectId) {
+async function assertStateMutationAllowed(env, session, oldState, newState, clientId, hintedProjectId, hintedWorkspaceId) {
   const changed = changedExistingProjectIds(oldState, newState);
   if (hintedProjectId && !changed.includes(hintedProjectId) && projectMapFromState(oldState).has(hintedProjectId)) changed.push(hintedProjectId);
   for (const projectId of changed) {
-    await assertProjectEditable(env, session, projectId, clientId);
+    await assertProjectEditable(env, session, projectId, clientId, { workspaceId: hintedWorkspaceId });
   }
 }
 
 async function getState(env, session) {
+  if (isAdminSession(session)) return await getAdminState(env, session);
   const row = await env.DB.prepare('SELECT state_json,updated_at,updated_by FROM planner_states WHERE workspace_id=?')
     .bind(session.workspace.id).first();
   return json({ state: row?.state_json ? JSON.parse(row.state_json) : null, updatedAt: row?.updated_at || null, updatedBy: row?.updated_by || null });
 }
 
+async function getAdminState(env, session) {
+  const rows = await env.DB.prepare(`SELECT w.id,w.name,w.invite_code,ps.state_json,ps.updated_at,ps.updated_by
+    FROM workspaces w LEFT JOIN planner_states ps ON ps.workspace_id=w.id ORDER BY w.created_at ASC`).all();
+  const projects = [];
+  let updatedAt = null;
+  const adminWorkspaceIds = [];
+  for (const row of rows.results || []) {
+    adminWorkspaceIds.push(row.id);
+    if (row.updated_at && (!updatedAt || row.updated_at > updatedAt)) updatedAt = row.updated_at;
+    if (!row.state_json) continue;
+    let parsed = null;
+    try { parsed = JSON.parse(row.state_json); } catch {}
+    for (const project of Array.isArray(parsed?.projects) ? parsed.projects : []) projects.push(decorateProject(project, row));
+  }
+  return json({ state: { version: 7, view: 'projects', selectedProjectId: projects[0]?.id || '', activeTab: 'main', adminWorkspaceIds, projects }, updatedAt, updatedBy: 'admin-view' });
+}
+
 async function putState(request, env, session) {
   const body = await readJson(request);
   if (!body.state || typeof body.state !== 'object') return json({ message: '缺少 state 数据' }, 400);
+  if (isAdminSession(session)) return await putAdminState(request, env, session, body);
 
   const current = await env.DB.prepare('SELECT state_json FROM planner_states WHERE workspace_id=?')
     .bind(session.workspace.id).first();
@@ -467,13 +549,29 @@ async function putState(request, env, session) {
 
   // 最关键的协同保证：任何项目内容变化，都必须在服务器端校验项目锁。
   // 即使前端显示错、按钮没禁用、用户手动调用 API，也不能绕过。
-  await assertStateMutationAllowed(env, session, oldState, body.state, clean(body.clientId), clean(body.projectId));
+  await assertStateMutationAllowed(env, session, oldState, body.state, clean(body.clientId), clean(body.projectId), clean(body.projectWorkspaceId));
 
   const stateJson = JSON.stringify(body.state);
   const now = new Date().toISOString();
   await env.DB.prepare(`INSERT INTO planner_states (workspace_id,state_json,updated_at,updated_by) VALUES (?,?,?,?)
     ON CONFLICT(workspace_id) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
     .bind(session.workspace.id, stateJson, now, session.user.id).run();
+  return json({ ok: true, updatedAt: now, updatedBy: session.user.id });
+}
+
+
+async function putAdminState(request, env, session, body) {
+  const now = new Date().toISOString();
+  const projects = Array.isArray(body.state?.projects) ? body.state.projects : [];
+  const workspaceIds = new Set(Array.isArray(body.state?.adminWorkspaceIds) ? body.state.adminWorkspaceIds.filter(Boolean) : []);
+  for (const project of projects) workspaceIds.add(project._workspaceId || session.workspace.id);
+  for (const workspaceId of workspaceIds) {
+    const workspaceProjects = projects.filter(project => String(project._workspaceId || session.workspace.id) === String(workspaceId)).map(cleanProjectForStorage);
+    const stateJson = JSON.stringify({ version: 7, view: 'projects', selectedProjectId: workspaceProjects[0]?.id || '', activeTab: 'main', projects: workspaceProjects });
+    await env.DB.prepare(`INSERT INTO planner_states (workspace_id,state_json,updated_at,updated_by) VALUES (?,?,?,?)
+      ON CONFLICT(workspace_id) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at,updated_by=excluded.updated_by`)
+      .bind(workspaceId, stateJson, now, session.user.id).run();
+  }
   return json({ ok: true, updatedAt: now, updatedBy: session.user.id });
 }
 
@@ -507,10 +605,11 @@ async function uploadImage(request, env, session) {
   const bytes = base64ToBytes(match[2]);
   // D1 单行最大约 2MB；前端会先压缩到 1MB 内，base64 后仍可放入一行。
   if (bytes.byteLength > 1024 * 1024) return json({ message: '图片太大，请压缩到 1MB 以内' }, 413);
+  const workspaceId = targetWorkspaceId(session, body.workspaceId);
   const imageId = id('img');
   const now = new Date().toISOString();
   const insert = () => env.DB.prepare('INSERT INTO images (id,workspace_id,object_key,name,content_type,bytes,created_by,created_at,data_url) VALUES (?,?,?,?,?,?,?,?,?)')
-    .bind(imageId, session.workspace.id, imageId, name, contentType, bytes.byteLength, session.user.id, now, dataUrl).run();
+    .bind(imageId, workspaceId, imageId, name, contentType, bytes.byteLength, session.user.id, now, dataUrl).run();
   try {
     await insert();
   } catch (err) {
@@ -528,8 +627,9 @@ async function uploadImage(request, env, session) {
 async function getImage(request, env, session, key) {
   key = String(key || '');
   if (!key) return json({ message: '缺少图片 key' }, 400);
-  const row = await env.DB.prepare('SELECT data_url,content_type FROM images WHERE workspace_id=? AND object_key=?')
-    .bind(session.workspace.id, key).first();
+  const row = isAdminSession(session)
+    ? await env.DB.prepare('SELECT data_url,content_type FROM images WHERE object_key=?').bind(key).first()
+    : await env.DB.prepare('SELECT data_url,content_type FROM images WHERE workspace_id=? AND object_key=?').bind(session.workspace.id, key).first();
   if (!row || !row.data_url) return json({ message: '图片不存在' }, 404);
   const match = String(row.data_url).match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
   if (!match) return json({ message: '图片数据损坏' }, 500);
@@ -545,7 +645,8 @@ async function getImage(request, env, session, key) {
 async function deleteImage(request, env, session, key) {
   key = String(key || '');
   if (!key) return json({ message: '缺少图片 key' }, 400);
-  await env.DB.prepare('DELETE FROM images WHERE workspace_id=? AND object_key=?').bind(session.workspace.id, key).run();
+  if (isAdminSession(session)) await env.DB.prepare('DELETE FROM images WHERE object_key=?').bind(key).run();
+  else await env.DB.prepare('DELETE FROM images WHERE workspace_id=? AND object_key=?').bind(session.workspace.id, key).run();
   return json({ ok: true });
 }
 
@@ -565,7 +666,7 @@ async function requireSession(request, env) {
   }
   if (!workspace) workspace = await firstWorkspace(env, row.user_id);
   if (!workspace) throw httpError('当前账号没有团队空间', 403);
-  return { user: { id: row.user_id, name: row.name, email: row.email }, workspace };
+  return { user: { id: row.user_id, name: row.name, email: row.email, isAdmin: isAdminEmail(row.email) }, workspace };
 }
 
 async function firstWorkspace(env, userId) {
@@ -592,7 +693,7 @@ async function createSession(env, userId, workspaceId) {
 function sessionCookie(token) {
   return `${COOKIE_NAME}=${token}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=${SESSION_DAYS * 86400}`;
 }
-function publicUser(user) { return user ? { id: user.id, name: user.name, email: user.email } : null; }
+function publicUser(user) { return user ? { id: user.id, name: user.name, email: user.email, isAdmin: isAdminEmail(user.email) } : null; }
 function publicWorkspace(workspace) { return workspace ? { id: workspace.id, name: workspace.name, inviteCode: workspace.invite_code } : null; }
 function clean(value) { return String(value || '').trim(); }
 function id(prefix) { return `${prefix}_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`; }
