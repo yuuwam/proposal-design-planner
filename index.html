@@ -165,6 +165,10 @@
     .field.full{grid-column:1/-1}
     .field-label{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;font-weight:850;color:#394356}
     textarea.copy{min-height:118px}
+    .copy-split{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .copy-split .copy-body-wrap{grid-column:1/-1}
+    .copy-split label{display:flex;flex-direction:column;gap:6px;font-size:11px;font-weight:800;color:#5a6475}
+    .copy-split textarea.copy-body{min-height:100px}
     textarea.scene{min-height:116px}
     textarea.prompt{min-height:205px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;font-size:12px;line-height:1.65;background:#11151c;color:#e8edf7;border-color:#252c38}
     textarea.prompt:focus{background:#11151c;color:#fff;border-color:#f0ad4c}
@@ -439,7 +443,7 @@
     }
     if(parts[0]==='section'){
       const section=targetState.projects.flatMap(p=>[...(p.mainSections||[]),...(p.aplusSections||[])]).find(s=>s.id===parts[1]);
-      if(section&&['title','size','copy','scene'].includes(parts[2]))section[parts[2]]=value;
+      if(section&&['title','size','copy','copyTitle','copySubtitle','copyBody','scene'].includes(parts[2])){section[parts[2]]=value;if(['copyTitle','copySubtitle','copyBody'].includes(parts[2]))section.copy=composeSectionCopy(section);}
       return;
     }
     if(parts[0]==='prompt'){
@@ -744,7 +748,7 @@
   function createPrompt(manual=''){return {id:uid(),manual:String(manual||'')}}
   function createSection(title,type='main'){
     return {
-      id:uid(), title, referenceImages:[], materialImages:[], copy:'', scene:'',
+      id:uid(), title, referenceImages:[], materialImages:[], copyTitle:'', copySubtitle:'', copyBody:'', copy:'', scene:'',
       size:type==='aplus' ? '1464 × 600 px / 21:9' : '2000 × 2000 px / 1:1',
       prompts:[createPrompt()], updatedAt:nowISO()
     };
@@ -778,19 +782,25 @@
     return cloudWorkspace?.id ? `${STATE_KEY}:${cloudWorkspace.id}` : STATE_KEY;
   }
   function emptyState(){
-    return {version:7,view:'projects',selectedProjectId:'',activeTab:'main',projects:[]};
+    return {version:8,view:'projects',selectedProjectId:'',activeTab:'main',projects:[]};
   }
 
   function initialState(){
     const p=createProject('示例项目｜产品视觉策划方案');
     p.brief='填写产品定位、目标人群、核心卖点、竞品参考和整体视觉方向。所有修改都会自动保存。';
-    p.mainSections[0].copy='产品名称 / 核心关键词 / 必须保留的产品外观要求';
+    p.mainSections[0].copyTitle='产品名称 / 核心关键词';
+    p.mainSections[0].copySubtitle='核心卖点一句话';
+    p.mainSections[0].copyBody='必须保留的产品外观要求 / 平台合规要求 / 其他文案信息';
+    p.mainSections[0].copy=composeSectionCopy(p.mainSections[0]);
     p.mainSections[0].scene='纯白背景，产品居中，主体占画面约85%，产品外观严格保持参考图一致。';
     p.mainSections[0].prompts[0].manual='商业棚拍灯光，高清细节，边缘干净，符合电商平台主图规范。';
-    p.aplusSections[0].copy='主标题：Brand Story / Product Advantage\n副标题：用一句话说明产品价值';
+    p.aplusSections[0].copyTitle='Brand Story / Product Advantage';
+    p.aplusSections[0].copySubtitle='用一句话说明产品价值';
+    p.aplusSections[0].copyBody='补充品牌故事、核心优势、使用场景或信任背书。';
+    p.aplusSections[0].copy=composeSectionCopy(p.aplusSections[0]);
     p.aplusSections[0].scene='宽幅品牌海报，产品位于视觉中心，背景体现目标用户使用场景。';
     p.aplusSections[0].prompts[0].manual='电影级柔和光线，高端商业广告风格，画面干净、可信。';
-    return {version:7,view:'projects',selectedProjectId:p.id,activeTab:'main',projects:[p]};
+    return {version:8,view:'projects',selectedProjectId:p.id,activeTab:'main',projects:[p]};
   }
 
   function migrateSection(section,type){
@@ -807,7 +817,7 @@
       id:s.id||uid(), title:s.title||'未命名板块',
       referenceImages:Array.isArray(s.referenceImages)?s.referenceImages:(Array.isArray(s.primaryImages)?s.primaryImages:[]),
       materialImages:Array.isArray(s.materialImages)?s.materialImages:(Array.isArray(s.secondaryImages)?s.secondaryImages:[]),
-      copy:s.copy||'', scene:s.scene||'',
+      ...normalizeCopyFields(s), scene:s.scene||'',
       size:s.size|| (type==='aplus'?'1464 × 600 px / 21:9':'2000 × 2000 px / 1:1'),
       prompts, updatedAt:s.updatedAt||nowISO()
     };
@@ -827,13 +837,63 @@
     if(!raw||!Array.isArray(raw.projects)) return emptyState();
     const projects=raw.projects.map(migrateProject);
     return {
-      version:7,
+      version:8,
       view:raw.view==='workspace'?'workspace':'projects',
       selectedProjectId:projects.some(p=>p.id===raw.selectedProjectId)?raw.selectedProjectId:(projects[0]?.id||''),
       activeTab:raw.activeTab==='aplus'?'aplus':'main',
       adminWorkspaceIds:Array.isArray(raw.adminWorkspaceIds)?raw.adminWorkspaceIds:undefined,
       projects
     };
+  }
+
+  function normalizeCopyFields(section){
+    const rawTitle = section?.copyTitle;
+    const rawSubtitle = section?.copySubtitle;
+    const rawBody = section?.copyBody;
+    if(rawTitle !== undefined || rawSubtitle !== undefined || rawBody !== undefined){
+      const result={
+        copyTitle:String(rawTitle||''),
+        copySubtitle:String(rawSubtitle||''),
+        copyBody:String(rawBody||'')
+      };
+      result.copy=composeSectionCopy(result);
+      return result;
+    }
+    const legacy=String(section?.copy||'');
+    const result={copyTitle:'',copySubtitle:'',copyBody:''};
+    if(legacy){
+      const lines=legacy.split(/\r?\n/);
+      const body=[];
+      for(const line of lines){
+        const trimmed=line.trim();
+        if(/^主标题[：:]/.test(trimmed) && !result.copyTitle){
+          result.copyTitle=trimmed.replace(/^主标题[：:]\s*/,'');
+        }else if(/^副标题[：:]/.test(trimmed) && !result.copySubtitle){
+          result.copySubtitle=trimmed.replace(/^副标题[：:]\s*/,'');
+        }else if(/^正文[：:]/.test(trimmed) && !result.copyBody){
+          result.copyBody=trimmed.replace(/^正文[：:]\s*/,'');
+        }else if(trimmed){
+          body.push(line);
+        }
+      }
+      if(body.length){
+        result.copyBody=body.join('\n').trim();
+      }else if(!result.copyTitle && !result.copySubtitle && !result.copyBody){
+        result.copyBody=legacy;
+      }
+    }
+    result.copy=composeSectionCopy(result);
+    return result;
+  }
+  function composeSectionCopy(section){
+    const title=String(section?.copyTitle||'').trim();
+    const subtitle=String(section?.copySubtitle||'').trim();
+    const body=String(section?.copyBody||'').trim();
+    return [
+      title?`主标题：${title}`:'',
+      subtitle?`副标题：${subtitle}`:'',
+      body?`正文：${body}`:''
+    ].filter(Boolean).join('\n');
   }
 
   function stripAutoPrompt(text,section){
@@ -847,7 +907,7 @@
   function buildAutoPrefix(section){
     const title=String(section?.title||'未命名板块').trim()||'未命名板块';
     const size=String(section?.size||'').trim();
-    const copy=String(section?.copy||'').trim();
+    const copy=composeSectionCopy(section);
     return `${title}
 比例：${size}
 文案：
@@ -1171,7 +1231,7 @@ ${copy}`;
           ${renderImageBox(section,'materialImages','图片素材','场景、配色、质感、包装、图标或局部素材。','section')}
         </div>
         <div class="form-grid">
-          <div class="field full"><div class="field-label"><span>文案 <span class="hint">${isAdmin()?'内容会自动同步到 AI 提示词':'填写标题、副标题、标签、卖点文案'}</span></span>${isAdmin()?'<button class="btn small" type="button" data-action="append-copy-to-prompt">一键填入提示词</button>':''}</div><textarea class="copy" data-field="copy" placeholder="标题、副标题、标签、卖点文案……" ${realtimeField(`section:${section.id}:copy`,`文案`)}>${esc(section.copy)}</textarea></div>
+          <div class="field full"><div class="field-label"><span>文案 <span class="hint">${isAdmin()?'主标题 / 副标题 / 正文会自动同步到 AI 提示词':'填写主标题、副标题、正文'}</span></span>${isAdmin()?'<button class="btn small" type="button" data-action="append-copy-to-prompt">一键填入提示词</button>':''}</div><div class="copy-split"><label>主标题<input type="text" class="copy-title" data-field="copyTitle" placeholder="例如：Premium Product Display" value="${esc(section.copyTitle||'')}" ${realtimeField(`section:${section.id}:copyTitle`,`主标题`)} /></label><label>副标题<input type="text" class="copy-subtitle" data-field="copySubtitle" placeholder="例如：核心卖点一句话" value="${esc(section.copySubtitle||'')}" ${realtimeField(`section:${section.id}:copySubtitle`,`副标题`)} /></label><label class="copy-body-wrap">正文<textarea class="copy copy-body" data-field="copyBody" placeholder="填写正文、卖点说明、标签、补充文案……" ${realtimeField(`section:${section.id}:copyBody`,`正文`)}>${esc(section.copyBody||'')}</textarea></label></div></div>
           <div class="field full"><div class="field-label">场景描述 / 图片要求</div><textarea class="scene" data-field="scene" placeholder="场景、构图、产品角度、人物、道具、光线等要求……" ${realtimeField(`section:${section.id}:scene`,`场景描述 / 图片要求`)}>${esc(section.scene)}</textarea></div>
           ${isAdmin()?`<div class="field full">
             <div class="field-label"><span>AI 提示词 <span class="sync-note">每条提示词都会自动同步“主题”“比例”和“文案”</span></span><button class="btn small primary" type="button" data-action="add-prompt">＋ 增加提示词</button></div>
@@ -1227,7 +1287,8 @@ ${copy}`;
             if(prompt)prompt.manual=extractManualPrompt(input.value);
           }else s[field]=input.value;
           s.updatedAt=nowISO();scheduleSave();
-          if(field==='title'||field==='size'||field==='copy'){
+          if(field==='title'||field==='size'||['copyTitle','copySubtitle','copyBody','copy'].includes(field)){
+            if(['copyTitle','copySubtitle','copyBody'].includes(field))s.copy=composeSectionCopy(s);
             $$('.prompt-item',el).forEach(item=>{
               const prompt=s.prompts.find(p=>p.id===item.dataset.promptId);
               const textarea=$('[data-field="promptCombined"]',item);
@@ -1255,7 +1316,8 @@ ${copy}`;
         if(action==='refresh-single-prompt'&&prompt){$('[data-field="promptCombined"]',promptItem).value=buildPrompt(s,prompt);toast('自动内容已刷新')}
         if(action==='copy-single-prompt'&&prompt)copyText(buildPrompt(s,prompt));
         if(action==='append-copy-to-prompt'){
-          const copy=String(s.copy||'').trim();
+          s.copy=composeSectionCopy(s);
+          const copy=s.copy.trim();
           if(!copy){toast('请先填写文案');return}
           if(!s.prompts.length)s.prompts.push(createPrompt());
           s.prompts.forEach(prompt=>{const current=String(prompt.manual||'').replace(/\s+$/,'');prompt.manual=current?`${current}\n\n${copy}`:copy});
