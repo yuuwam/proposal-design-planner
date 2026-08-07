@@ -341,7 +341,8 @@ async function updatePresence(request, env, session) {
   return json({ ok: true, users, serverTime: now });
 }
 
-const PROJECT_LOCK_TTL_MS = 10 * 60 * 1000;
+const PROJECT_LOCK_TTL_MS = 2 * 60 * 1000;
+const PROJECT_LOCK_STALE_MS = 90 * 1000;
 
 
 function isAdminEmail(email) { return String(email || '').toLowerCase() === ADMIN_EMAIL; }
@@ -380,12 +381,16 @@ async function ensureProjectLocksTable(env) {
 
 async function cleanupExpiredProjectLocks(env) {
   await ensureProjectLocksTable(env);
-  await env.DB.prepare('DELETE FROM project_locks WHERE expires_at<=?').bind(new Date().toISOString()).run();
+  const now = Date.now();
+  const expiresBefore = new Date(now).toISOString();
+  const staleBefore = new Date(now - PROJECT_LOCK_STALE_MS).toISOString();
+  await env.DB.prepare('DELETE FROM project_locks WHERE expires_at<=? OR last_seen<=?').bind(expiresBefore, staleBefore).run();
 }
 
 function publicLock(row, clientId) {
   if (!row) return null;
-  const active = new Date(String(row.expires_at || '')).getTime() > Date.now();
+  const now = Date.now();
+  const active = new Date(String(row.expires_at || '')).getTime() > now && new Date(String(row.last_seen || '')).getTime() > now - PROJECT_LOCK_STALE_MS;
   const canEdit = !active || String(row.client_id || '') === String(clientId || '');
   return {
     projectId: row.project_id,
@@ -420,7 +425,8 @@ async function acquireProjectLock(request, env, session) {
   await cleanupExpiredProjectLocks(env);
   const existing = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=? AND project_id=?')
     .bind(workspaceId, projectId).first();
-  if (existing && String(existing.client_id || '') !== clientId && new Date(existing.expires_at).getTime() > Date.now()) {
+  const existingActive = existing && new Date(String(existing.expires_at || '')).getTime() > Date.now() && new Date(String(existing.last_seen || '')).getTime() > Date.now() - PROJECT_LOCK_STALE_MS;
+  if (existingActive && String(existing.client_id || '') !== clientId) {
     return json({ ok: false, canEdit: false, lock: publicLock(existing, clientId), message: '当前项目正在被其他窗口或成员编辑' });
   }
   const now = new Date().toISOString();
@@ -472,7 +478,7 @@ async function assertProjectEditable(env, session, projectId, clientId, options 
   await cleanupExpiredProjectLocks(env);
   const row = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=? AND project_id=?')
     .bind(workspaceId, projectId).first();
-  const active = row && new Date(row.expires_at).getTime() > Date.now();
+  const active = row && new Date(String(row.expires_at || '')).getTime() > Date.now() && new Date(String(row.last_seen || '')).getTime() > Date.now() - PROJECT_LOCK_STALE_MS;
   const ownsLock = active && String(row.client_id || '') === String(clientId || '');
   if (ownsLock) return;
 

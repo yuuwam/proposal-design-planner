@@ -530,7 +530,7 @@
   }
   function startLockHeartbeat(){
     if(lockHeartbeatTimer)clearInterval(lockHeartbeatTimer);
-    if(currentProjectLock?.canEdit)lockHeartbeatTimer=setInterval(heartbeatProjectLock,30000);
+    if(currentProjectLock?.canEdit)lockHeartbeatTimer=setInterval(heartbeatProjectLock,20000);
   }
   async function releaseProjectLock(projectId,stateOnly=false){
     const idToRelease=projectId||currentProjectLock?.projectId||realtimeProjectId||state?.selectedProjectId;
@@ -1645,6 +1645,8 @@ ${copy}`;
     if(e.key==='Escape'){closeLightbox();hideProjectModal();hideEditLockModal()}
   });
   window.addEventListener('beforeunload',()=>{releaseProjectLock(state?.selectedProjectId,true);sendRealtime({type:'editing:end'});if(saveTimer&&currentProjectLock?.canEdit)saveState(false)});
+  window.addEventListener('pagehide',()=>{releaseProjectLock(state?.selectedProjectId,true)});
+  document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden'&&state?.view==='workspace'){releaseProjectLock(state?.selectedProjectId,true)}});
 
   loadState().then(()=>{render()});
 })();
