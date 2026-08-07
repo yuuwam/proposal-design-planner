@@ -148,6 +148,10 @@ async function handleApi(context) {
     if (path === 'state' && request.method === 'GET') return await getState(env, session);
     if (path === 'state' && request.method === 'PUT') return await putState(request, env, session);
     if (path === 'presence' && request.method === 'POST') return await updatePresence(request, env, session);
+    if (path === 'project-locks' && request.method === 'GET') return await listProjectLocks(env, session, url);
+    if (path === 'project-locks/acquire' && request.method === 'POST') return await acquireProjectLock(request, env, session);
+    if (path === 'project-locks/heartbeat' && request.method === 'POST') return await heartbeatProjectLock(request, env, session);
+    if (path === 'project-locks/release' && request.method === 'POST') return await releaseProjectLock(request, env, session);
     if (path === 'workspace/join' && request.method === 'POST') return await joinWorkspace(request, env, session);
     if (path === 'images' && request.method === 'POST') return await uploadImage(request, env, session);
     if (path === 'images' && request.method === 'GET') return await getImage(request, env, session, url.searchParams.get('key'));
@@ -299,6 +303,118 @@ async function updatePresence(request, env, session) {
   return json({ ok: true, users, serverTime: now });
 }
 
+const PROJECT_LOCK_TTL_MS = 10 * 60 * 1000;
+
+async function ensureProjectLocksTable(env) {
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS project_locks (
+    workspace_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    locked_by_user_id TEXT NOT NULL,
+    locked_by_email TEXT,
+    locked_by_name TEXT,
+    client_id TEXT NOT NULL,
+    locked_at TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, project_id)
+  )`).run();
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_project_locks_expires ON project_locks(expires_at)').run();
+}
+
+async function cleanupExpiredProjectLocks(env) {
+  await ensureProjectLocksTable(env);
+  await env.DB.prepare('DELETE FROM project_locks WHERE expires_at<=?').bind(new Date().toISOString()).run();
+}
+
+function publicLock(row, clientId) {
+  if (!row) return null;
+  const active = new Date(String(row.expires_at || '')).getTime() > Date.now();
+  const canEdit = !active || String(row.client_id || '') === String(clientId || '');
+  return {
+    projectId: row.project_id,
+    canEdit,
+    lockedByUserId: row.locked_by_user_id,
+    lockedByEmail: row.locked_by_email,
+    lockedByName: row.locked_by_name,
+    clientId: row.client_id,
+    lockedAt: row.locked_at,
+    lastSeen: row.last_seen,
+    expiresAt: row.expires_at
+  };
+}
+
+async function listProjectLocks(env, session, url) {
+  const clientId = clean(url.searchParams.get('clientId'));
+  await cleanupExpiredProjectLocks(env);
+  const rows = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=?').bind(session.workspace.id).all();
+  const locks = {};
+  for (const row of rows.results || []) locks[row.project_id] = publicLock(row, clientId);
+  return json({ ok: true, locks, serverTime: new Date().toISOString() });
+}
+
+async function acquireProjectLock(request, env, session) {
+  const body = await readJson(request);
+  const projectId = clean(body.projectId);
+  const clientId = clean(body.clientId);
+  if (!projectId || !clientId) return json({ message: '缺少 projectId 或 clientId' }, 400);
+  await cleanupExpiredProjectLocks(env);
+  const existing = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=? AND project_id=?')
+    .bind(session.workspace.id, projectId).first();
+  if (existing && String(existing.client_id || '') !== clientId && new Date(existing.expires_at).getTime() > Date.now()) {
+    return json({ ok: false, canEdit: false, lock: publicLock(existing, clientId), message: '当前项目正在被其他窗口或成员编辑' });
+  }
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + PROJECT_LOCK_TTL_MS).toISOString();
+  await env.DB.prepare(`INSERT INTO project_locks (workspace_id,project_id,locked_by_user_id,locked_by_email,locked_by_name,client_id,locked_at,last_seen,expires_at)
+    VALUES (?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(workspace_id,project_id) DO UPDATE SET locked_by_user_id=excluded.locked_by_user_id,locked_by_email=excluded.locked_by_email,locked_by_name=excluded.locked_by_name,client_id=excluded.client_id,last_seen=excluded.last_seen,expires_at=excluded.expires_at`)
+    .bind(session.workspace.id, projectId, session.user.id, session.user.email || '', session.user.name || '', clientId, existing?.locked_at || now, now, expiresAt).run();
+  const row = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=? AND project_id=?').bind(session.workspace.id, projectId).first();
+  return json({ ok: true, canEdit: true, lock: publicLock(row, clientId) });
+}
+
+async function heartbeatProjectLock(request, env, session) {
+  const body = await readJson(request);
+  const projectId = clean(body.projectId);
+  const clientId = clean(body.clientId);
+  if (!projectId || !clientId) return json({ message: '缺少 projectId 或 clientId' }, 400);
+  await cleanupExpiredProjectLocks(env);
+  const row = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=? AND project_id=?')
+    .bind(session.workspace.id, projectId).first();
+  if (!row) return json({ ok: false, canEdit: false, message: '项目编辑锁不存在' });
+  if (String(row.client_id || '') !== clientId) return json({ ok: false, canEdit: false, lock: publicLock(row, clientId), message: '当前项目正在被其他窗口或成员编辑' });
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + PROJECT_LOCK_TTL_MS).toISOString();
+  await env.DB.prepare('UPDATE project_locks SET last_seen=?,expires_at=? WHERE workspace_id=? AND project_id=? AND client_id=?')
+    .bind(now, expiresAt, session.workspace.id, projectId, clientId).run();
+  const updated = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=? AND project_id=?').bind(session.workspace.id, projectId).first();
+  return json({ ok: true, canEdit: true, lock: publicLock(updated, clientId) });
+}
+
+async function releaseProjectLock(request, env, session) {
+  const body = await readJson(request);
+  const projectId = clean(body.projectId);
+  const clientId = clean(body.clientId);
+  if (!projectId || !clientId) return json({ ok: true });
+  await ensureProjectLocksTable(env);
+  await env.DB.prepare('DELETE FROM project_locks WHERE workspace_id=? AND project_id=? AND client_id=?')
+    .bind(session.workspace.id, projectId, clientId).run();
+  return json({ ok: true });
+}
+
+async function assertProjectEditable(env, session, projectId, clientId) {
+  if (!projectId) return;
+  await cleanupExpiredProjectLocks(env);
+  const row = await env.DB.prepare('SELECT * FROM project_locks WHERE workspace_id=? AND project_id=?')
+    .bind(session.workspace.id, projectId).first();
+  if (!row) return;
+  if (String(row.client_id || '') !== String(clientId || '') && new Date(row.expires_at).getTime() > Date.now()) {
+    const err = new Error('当前项目正在被其他窗口或成员编辑，无法保存');
+    err.status = 423;
+    throw err;
+  }
+}
+
 async function getState(env, session) {
   const row = await env.DB.prepare('SELECT state_json,updated_at,updated_by FROM planner_states WHERE workspace_id=?')
     .bind(session.workspace.id).first();
@@ -308,6 +424,7 @@ async function getState(env, session) {
 async function putState(request, env, session) {
   const body = await readJson(request);
   if (!body.state || typeof body.state !== 'object') return json({ message: '缺少 state 数据' }, 400);
+  await assertProjectEditable(env, session, clean(body.projectId), clean(body.clientId));
   const stateJson = JSON.stringify(body.state);
   const now = new Date().toISOString();
   await env.DB.prepare(`INSERT INTO planner_states (workspace_id,state_json,updated_at,updated_by) VALUES (?,?,?,?)

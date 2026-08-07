@@ -1,11 +1,13 @@
-# Proposal Design Planner｜D1 轮询协作修正版
+# Proposal Design Planner｜项目编辑锁版本
 
-这个版本修复：
+这是一个适合 Cloudflare Pages 免费版部署的多人同步版本：
 
-- 云端协作在线人数一直显示 1 人的问题。
-- 同团队两个账号同时打开同一项目时，后打开账号保存被覆盖或不同步的问题。
-- 保存前会尝试读取最新云端状态，并按项目 / 板块更新时间做合并，减少整份数据互相覆盖。
-- 在线人数通过 D1 `collab_presence` 表记录同一项目内的在线成员。
+- Pages 发布网站与 API。
+- D1 保存账号、团队、项目、图片和编辑锁。
+- 不使用 R2，不需要绑定银行卡。
+- 同一个团队可以共享项目库。
+- 同一个项目同一时间只允许一个窗口/成员编辑，其他人只能查看。
+- 项目列表页会显示“可编辑 / 无法编辑”。
 
 ## Cloudflare Pages 构建设置
 
@@ -16,35 +18,46 @@ Build output directory: dist
 Root directory: /
 ```
 
-## D1 绑定
+## wrangler.jsonc
 
-变量名必须是：
+部署前请打开 `wrangler.jsonc`，把：
 
-```text
-DB
+```jsonc
+"database_id": "请替换成你的真实 D1 Database ID"
 ```
 
-如果使用 `wrangler.jsonc`，把里面的 `database_id` 换成你的真实 D1 Database ID。
+替换成你自己的 D1 Database ID。
 
-## 旧数据库升级
+## D1 初始化
 
-如果你已经执行过旧版 schema，只需要在 D1 Console 里执行：
+如果是新数据库，执行 `schema.sql`。
+
+如果是在现有数据库上升级，只需要执行：
 
 ```sql
-CREATE TABLE IF NOT EXISTS collab_presence (
+CREATE TABLE IF NOT EXISTS project_locks (
   workspace_id TEXT NOT NULL,
   project_id TEXT NOT NULL,
+  locked_by_user_id TEXT NOT NULL,
+  locked_by_email TEXT,
+  locked_by_name TEXT,
   client_id TEXT NOT NULL,
-  user_id TEXT NOT NULL,
-  user_name TEXT,
-  user_email TEXT,
+  locked_at TEXT NOT NULL,
   last_seen TEXT NOT NULL,
-  PRIMARY KEY (workspace_id, project_id, client_id)
+  expires_at TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, project_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_collab_presence_project ON collab_presence(workspace_id, project_id, last_seen);
+CREATE INDEX IF NOT EXISTS idx_project_locks_expires ON project_locks(expires_at);
 ```
 
-也可以直接执行文件：`upgrade_collaboration_presence.sql`。
+也可以直接执行 `upgrade_project_locks.sql`。
 
-如果是新建数据库，直接执行 `schema.sql`。
+## 编辑锁规则
+
+- A 打开项目后获得编辑权限。
+- B 打开同一个项目时，项目列表与项目页都会显示“无法编辑”。
+- B 可以查看，但不能修改、上传图片、删除板块或保存。
+- A 返回项目列表、退出登录、关闭页面，系统会尝试释放锁。
+- 如果 A 异常关闭浏览器，锁会在约 10 分钟后自动释放。
+- A 持续编辑时，系统会自动续期。

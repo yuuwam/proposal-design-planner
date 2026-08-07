@@ -81,6 +81,10 @@
     .project-card-title{font-weight:850;font-size:16px;line-height:1.4;margin:0 34px 7px 0;word-break:break-word;color:#171b24;cursor:pointer}
     .project-card-title:hover{color:#a65f00}
     .project-meta{font-size:12px;color:#778195;display:flex;gap:10px;flex-wrap:wrap}
+    .edit-badge{display:inline-flex;align-items:center;gap:5px;border-radius:999px;padding:4px 8px;font-size:11px;font-weight:900;white-space:nowrap;border:1px solid transparent}
+    .edit-badge.ok{background:#ecfdf3;border-color:#bbf7d0;color:#166534}
+    .edit-badge.locked{background:#fff1f2;border-color:#fecdd3;color:#be123c}
+    .edit-badge.checking{background:#f1f5f9;border-color:#dbe3ee;color:#64748b}
     .project-card-footer{display:flex;justify-content:space-between;align-items:center;border-top:1px solid #edf0f5;margin-top:14px;padding-top:12px}
     .updated{font-size:11px;color:#919bad}
     .card-delete{position:absolute;right:12px;top:164px;background:#f7f8fb;border:1px solid #e4e8ef;color:#8791a3;width:30px;height:30px;border-radius:9px;z-index:3}
@@ -93,7 +97,16 @@
     .back-link{display:inline-flex;align-items:center;gap:7px;color:#7b8495;font-size:13px;margin-bottom:8px;cursor:pointer}
     .back-link:hover{color:#a65f00}
     .project-name-input{width:min(760px,100%);border:0;background:transparent;outline:0;font-weight:900;font-size:30px;line-height:1.2;color:#161a22;padding:0}
-    .save-meta{font-size:12px;color:#7c8698;margin-top:8px;display:flex;align-items:center;gap:8px}
+    .save-meta{font-size:12px;color:#7c8698;margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+    .edit-lock-banner{margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;border:1px solid #dce5ef;border-radius:13px;padding:8px 10px;background:#fff}
+    .edit-lock-banner.can-edit{background:#f0fdf4;border-color:#bbf7d0;color:#166534}
+    .edit-lock-banner.cannot-edit{background:#fff1f2;border-color:#fecdd3;color:#be123c}
+    .edit-lock-banner.checking{background:#f8fafc;border-color:#dbe3ee;color:#64748b}
+    .readonly-mask{border:1px solid #fecdd3;background:#fff1f2;color:#be123c;border-radius:14px;padding:10px 12px;margin-bottom:14px;font-size:13px;font-weight:800}
+    .workspace-readonly input:not([type="file"]),.workspace-readonly textarea{background:#f4f6f9!important;color:#6b7280!important;border-color:#d7dde7!important;box-shadow:none!important;cursor:not-allowed}
+    .workspace-readonly .image-box{opacity:.74}
+    .workspace-readonly .thumb{pointer-events:auto}
+    .workspace-readonly button[data-action],.workspace-readonly button[data-image-action],.workspace-readonly #saveNow,.workspace-readonly #addSection,.workspace-readonly #clearBulkPrompt,.workspace-readonly #applyBulkPrompt,.workspace-readonly #deleteCurrentProject,.workspace-readonly #duplicateProject{opacity:.45;pointer-events:none}
     .status-dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 4px rgba(85,217,154,.14)}
     .summary-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(300px,.75fr);gap:16px;margin-bottom:18px}
     .panel{background:#fff;border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow);padding:17px}
@@ -346,6 +359,10 @@
   let cloudStateUpdatedAt = '';
   let localDirty = false;
   let saveGeneration = 0;
+  let projectLocks = {};
+  let currentProjectLock = null;
+  let lockHeartbeatTimer = null;
+  let projectLockRefreshTimer = null;
 
   const $ = (s,r=document) => r.querySelector(s);
   const $$ = (s,r=document) => Array.from(r.querySelectorAll(s));
@@ -409,6 +426,112 @@
     return apiFetch('/api/images',{method:'POST',body:{dataUrl,name}});
   }
 
+  function ensureClientId(){
+    if(realtimeClientId)return realtimeClientId;
+    try{realtimeClientId=localStorage.getItem('pdp_client_id')||''}catch(e){}
+    if(!realtimeClientId){
+      realtimeClientId=uid();
+      try{localStorage.setItem('pdp_client_id',realtimeClientId)}catch(e){}
+    }
+    return realtimeClientId;
+  }
+  function isLockActive(lock){return !!(lock&&lock.expiresAt&&new Date(lock.expiresAt).getTime()>Date.now())}
+  function canEditProject(projectId){
+    if(!cloudUser)return true;
+    const lock=projectId===state?.selectedProjectId?currentProjectLock:projectLocks[projectId];
+    if(!lock||lock.status==='checking')return false;
+    return !!lock.canEdit;
+  }
+  function editStatusHtml(projectId){
+    const lock=projectLocks[projectId];
+    if(!cloudUser)return '<span class="edit-badge ok">可编辑</span>';
+    if(!lock)return '<span class="edit-badge checking">检查中</span>';
+    if(lock.canEdit)return '<span class="edit-badge ok">可编辑</span>';
+    const who=lock.lockedByEmail||lock.lockedByName||'其他成员';
+    return `<span class="edit-badge locked" title="正在由 ${esc(who)} 编辑">无法编辑</span>`;
+  }
+  function currentLockBannerHtml(){
+    if(!cloudUser)return '';
+    const lock=currentProjectLock;
+    if(!lock||lock.status==='checking')return '<div class="edit-lock-banner checking">正在检查项目编辑状态……</div>';
+    if(lock.canEdit)return '<div class="edit-lock-banner can-edit">可编辑：你已获得当前项目的编辑权限。保持页面打开时会自动续期。</div>';
+    const who=lock.lockedByEmail||lock.lockedByName||'其他成员';
+    const until=lock.expiresAt?formatTime(lock.expiresAt):'稍后';
+    return `<div class="edit-lock-banner cannot-edit">无法编辑：当前项目正在由 ${esc(who)} 编辑。你现在只能查看，预计 ${esc(until)} 后自动释放。</div>`;
+  }
+  async function refreshProjectLocks(){
+    if(!cloudUser||!cloudApiReady)return;
+    try{
+      const data=await apiFetch(`/api/project-locks?clientId=${encodeURIComponent(ensureClientId())}`);
+      projectLocks=data?.locks||{};
+      if(state?.view==='projects')renderProjectCards($('#projectSearch')?.value||'');
+      if(state?.view==='workspace'&&state.selectedProjectId){
+        const lock=projectLocks[state.selectedProjectId];
+        if(lock)currentProjectLock=lock;
+        updateProjectEditMode();
+      }
+    }catch(e){console.warn('读取项目锁状态失败',e)}
+  }
+  async function acquireProjectLock(projectId){
+    if(!cloudUser||!cloudApiReady||!projectId)return;
+    ensureClientId();
+    currentProjectLock={projectId,status:'checking',canEdit:false};
+    projectLocks[projectId]=currentProjectLock;
+    updateProjectEditMode();
+    try{
+      const data=await apiFetch('/api/project-locks/acquire',{method:'POST',body:{projectId,clientId:realtimeClientId}});
+      currentProjectLock=data.lock||{projectId,canEdit:!!data.canEdit};
+      projectLocks[projectId]=currentProjectLock;
+      updateProjectEditMode();
+      startLockHeartbeat();
+      if(!currentProjectLock.canEdit)toast('当前项目已被其他窗口或成员锁定，只能查看');
+    }catch(e){currentProjectLock={projectId,canEdit:false,lockedByEmail:'系统',message:e.message};updateProjectEditMode();toast(e.message||'无法获得编辑权限')}
+  }
+  async function heartbeatProjectLock(){
+    const p=getProject();
+    if(!p||!cloudUser||!currentProjectLock?.canEdit)return;
+    try{
+      const data=await apiFetch('/api/project-locks/heartbeat',{method:'POST',body:{projectId:p.id,clientId:ensureClientId()}});
+      currentProjectLock=data.lock||currentProjectLock;
+      projectLocks[p.id]=currentProjectLock;
+      updateProjectEditMode();
+    }catch(e){console.warn('项目锁续期失败',e)}
+  }
+  function startLockHeartbeat(){
+    if(lockHeartbeatTimer)clearInterval(lockHeartbeatTimer);
+    if(currentProjectLock?.canEdit)lockHeartbeatTimer=setInterval(heartbeatProjectLock,30000);
+  }
+  async function releaseProjectLock(projectId,stateOnly=false){
+    const idToRelease=projectId||currentProjectLock?.projectId||realtimeProjectId||state?.selectedProjectId;
+    if(!idToRelease||!cloudUser||!cloudApiReady||!realtimeClientId)return;
+    const body=JSON.stringify({projectId:idToRelease,clientId:realtimeClientId});
+    try{
+      if(stateOnly&&navigator.sendBeacon){
+        navigator.sendBeacon('/api/project-locks/release',new Blob([body],{type:'application/json'}));
+      }else{
+        await apiFetch('/api/project-locks/release',{method:'POST',body:{projectId:idToRelease,clientId:realtimeClientId}});
+      }
+    }catch(e){}
+    if(currentProjectLock?.projectId===idToRelease)currentProjectLock=null;
+    if(projectLocks[idToRelease])delete projectLocks[idToRelease];
+  }
+  function updateProjectEditMode(){
+    const p=getProject();
+    const root=$('#workspaceShell');
+    if(!p||!root)return;
+    const readOnly=cloudUser&&!canEditProject(p.id);
+    root.classList.toggle('workspace-readonly',readOnly);
+    const banner=$('#editLockBanner');
+    if(banner)banner.outerHTML=currentLockBannerHtml();
+    root.querySelectorAll('input:not([type="file"]), textarea').forEach(el=>{
+      el.readOnly=readOnly;
+      if(el.id==='projectName'||el.tagName==='TEXTAREA'||el.classList.contains('section-title'))el.setAttribute('aria-readonly',readOnly?'true':'false');
+    });
+    root.querySelectorAll('[data-action], [data-image-action], #saveNow, #addSection, #clearBulkPrompt, #applyBulkPrompt, #deleteCurrentProject, #duplicateProject').forEach(btn=>{
+      if(btn.id==='backProjects')return;
+      btn.disabled=readOnly;
+    });
+  }
 
   function realtimeBadgeHtml(){
     const cls=realtimeConnected?'':'warn';
@@ -432,17 +555,22 @@
     if(realtimeProjectId===p.id&&realtimePollTimer)return;
     disconnectRealtime(false);
     realtimeProjectId=p.id;
-    realtimeClientId=realtimeClientId||uid();
+    ensureClientId();
     realtimeConnected=true;
     realtimeUsers=[{clientId:realtimeClientId,userName:cloudUser.name,userEmail:cloudUser.email,lastSeen:nowISO()}];
     updateRealtimeBadge();
+    acquireProjectLock(p.id);
     pollCloudStateForRealtime();
     realtimePollTimer=setInterval(pollCloudStateForRealtime,1800);
   }
   function disconnectRealtime(clear=true){
+    const oldProjectId=realtimeProjectId;
     if(realtimePollTimer)clearInterval(realtimePollTimer);
+    if(lockHeartbeatTimer)clearInterval(lockHeartbeatTimer);
+    lockHeartbeatTimer=null;
+    if(clear&&oldProjectId)releaseProjectLock(oldProjectId);
     realtimePollTimer=null;realtimeProjectId='';realtimeConnected=false;realtimePollBusy=false;
-    if(clear){realtimeUsers=[];realtimeLocks={};updateRealtimeBadge()}
+    if(clear){realtimeUsers=[];realtimeLocks={};currentProjectLock=null;updateRealtimeBadge()}
   }
   function sendRealtime(){return false}
   function queueRealtimeBroadcast(){
@@ -715,6 +843,9 @@ ${copy}`;
           cloudStateUpdatedAt=saved?.updatedAt||cloudStateUpdatedAt;
         }
         await dbSet(scopedKey,state);
+        refreshProjectLocks();
+        if(projectLockRefreshTimer)clearInterval(projectLockRefreshTimer);
+        projectLockRefreshTimer=setInterval(refreshProjectLocks,15000);
       }catch(e){
         console.warn('云端数据读取失败',e);
         state=emptyState();
@@ -727,6 +858,13 @@ ${copy}`;
   }
   async function saveState(show=false){
     if(!state)return;
+    const lockedProject=state.view==='workspace'?getProject():null;
+    if(cloudUser&&lockedProject&&!canEditProject(lockedProject.id)){
+      localDirty=false;
+      updateSaveStatus();
+      if(show)toast('当前项目无法编辑，未保存修改');
+      return;
+    }
     const thisSave=++saveGeneration;
     await dbSet(workspaceStateKey(),state);updateSaveStatus();
     if(cloudUser&&cloudApiReady){
@@ -740,7 +878,8 @@ ${copy}`;
             await dbSet(workspaceStateKey(),state);
           }
         }catch(e){console.warn('读取最新云端状态失败，继续保存当前内容',e)}
-        const saved=await apiFetch('/api/state',{method:'PUT',body:{state:outbound,clientId:realtimeClientId}});
+        const selectedProject=state.view==='workspace'?getProject():null;
+        const saved=await apiFetch('/api/state',{method:'PUT',body:{state:outbound,clientId:ensureClientId(),projectId:selectedProject&&canEditProject(selectedProject.id)?selectedProject.id:''}});
         cloudStateUpdatedAt=saved?.updatedAt||cloudStateUpdatedAt;
         if(thisSave===saveGeneration)localDirty=false;
         updateSaveStatus();queueRealtimeBroadcast();
@@ -820,6 +959,7 @@ ${copy}`;
     $('#projectSearch').addEventListener('input',e=>renderProjectCards(e.target.value));
     $('#addProjectTop').addEventListener('click',showProjectModal);
     bindCloudButtons();
+    refreshProjectLocks();
   }
 
   function renderProjectCards(keyword=''){
@@ -834,7 +974,7 @@ ${copy}`;
         <button class="card-delete" data-action="delete-project" title="删除项目">×</button>
         <div class="project-body">
           <h3 class="project-card-title" data-action="open-project">${esc(p.name)}</h3>
-          <div class="project-meta"><span>主图 ${p.mainSections.length}</span><span>详情页 ${p.aplusSections.length}</span><span>产品图 ${p.productImages.length}</span></div>
+          <div class="project-meta"><span>主图 ${p.mainSections.length}</span><span>详情页 ${p.aplusSections.length}</span><span>产品图 ${p.productImages.length}</span>${editStatusHtml(p.id)}</div>
           <div class="project-card-footer"><span class="updated">更新：${formatTime(p.updatedAt)}</span><button class="btn small" data-action="open-project">打开项目 →</button></div>
         </div>
       </article>`;
@@ -861,12 +1001,16 @@ ${copy}`;
     const p=getProject();if(!p){state.view='projects';return renderProjectsPage()}
     const sections=getSections(p);
     const imageCount=p.productImages.length+[...p.mainSections,...p.aplusSections].reduce((n,s)=>n+s.referenceImages.length+s.materialImages.length,0);
+    const readonly=cloudUser&&!canEditProject(p.id);
     $('#root').innerHTML=`
+      <div id="workspaceShell" class="${readonly?'workspace-readonly':''}">
+      ${readonly?'<div class="readonly-mask">当前项目无法编辑，你正在查看锁定版本。</div>':''}
       <div class="workspace-header">
         <div>
           <div class="back-link" id="backProjects">← 返回项目列表</div>
           <input class="project-name-input" id="projectName" value="${esc(p.name)}" placeholder="项目名称" ${realtimeField(`project:${p.id}:name`,`项目名称`)} />
           <div class="save-meta"><span class="status-dot"></span><span>自动保存</span><span id="saveStatus">更新：${formatTime(p.updatedAt)}</span>${realtimeBadgeHtml()}</div>
+          <div id="editLockBanner">${currentLockBannerHtml()}</div>
         </div>
         <div class="header-actions">
           ${cloudBadge('light')}
@@ -901,10 +1045,12 @@ ${copy}`;
           <button class="btn primary" id="addSection">＋ 添加板块</button>
         </div>
       </div>
-      <div class="sections">${sections.map((s,i)=>renderSection(s,i)).join('')}</div>`;
+      <div class="sections">${sections.map((s,i)=>renderSection(s,i)).join('')}</div>
+      </div>`;
     bindWorkspaceEvents();
     connectRealtimeForCurrentProject();
     updateRealtimeBadge();
+    updateProjectEditMode();
   }
 
   function renderSection(section,index){
@@ -953,16 +1099,17 @@ ${copy}`;
   function bindWorkspaceEvents(){
     bindCloudButtons();
     const p=getProject();
-    $('#backProjects').onclick=()=>{state.view='projects';scheduleSave();render()};
-    $('#projectName').addEventListener('input',e=>{p.name=e.target.value;touch()});
-    $('#projectBrief').addEventListener('input',e=>{p.brief=e.target.value;touch()});
-    $('#bulkPromptText').addEventListener('input',e=>{p.bulkPrompt=e.target.value;touch()});
-    $('#clearBulkPrompt').onclick=()=>{p.bulkPrompt='';$('#bulkPromptText').value='';touch();toast('批量内容已清空')};
-    $('#applyBulkPrompt').onclick=()=>applyBulkPrompt(p);
+    const blocked=()=>cloudUser&&p&&!canEditProject(p.id);
+    $('#backProjects').onclick=async()=>{await releaseProjectLock(p.id);state.view='projects';render()};
+    $('#projectName').addEventListener('input',e=>{if(blocked())return;p.name=e.target.value;touch()});
+    $('#projectBrief').addEventListener('input',e=>{if(blocked())return;p.brief=e.target.value;touch()});
+    $('#bulkPromptText').addEventListener('input',e=>{if(blocked())return;p.bulkPrompt=e.target.value;touch()});
+    $('#clearBulkPrompt').onclick=()=>{if(blocked())return toast('当前项目无法编辑');p.bulkPrompt='';$('#bulkPromptText').value='';touch();toast('批量内容已清空')};
+    $('#applyBulkPrompt').onclick=()=>{if(blocked())return toast('当前项目无法编辑');applyBulkPrompt(p)};
     $('#saveNow').onclick=()=>saveState(true);
     $('#duplicateProject').onclick=duplicateProject;
-    $('#deleteCurrentProject').onclick=()=>deleteProject(p.id);
-    $('#addSection').onclick=addSection;
+    $('#deleteCurrentProject').onclick=()=>{if(blocked())return toast('当前项目无法编辑');deleteProject(p.id)};
+    $('#addSection').onclick=()=>{if(blocked())return toast('当前项目无法编辑');addSection()};
     $$('.tab').forEach(btn=>btn.onclick=()=>{state.activeTab=btn.dataset.tab;scheduleSave();renderWorkspace()});
 
     $$('.section').forEach(el=>{
@@ -970,6 +1117,7 @@ ${copy}`;
       $$('[data-field]',el).forEach(input=>{
         const field=input.dataset.field;
         input.addEventListener('input',()=>{
+          if(blocked())return;
           if(field==='promptCombined'){
             const prompt=s.prompts.find(p=>p.id===input.dataset.promptId);
             if(prompt)prompt.manual=extractManualPrompt(input.value);
@@ -992,6 +1140,7 @@ ${copy}`;
         const promptItem=e.target.closest('.prompt-item');
         const prompt=promptItem?s.prompts.find(p=>p.id===promptItem.dataset.promptId):null;
         if(action==='delete-section')deleteSection(s.id);
+        if(blocked()&&action)return toast('当前项目无法编辑');
         if(action==='apply-size-current-demand')applySizeToCurrentDemand(s);
         if(action==='copy-prompt')copyText(buildAllPrompts(s));
         if(action==='add-prompt'){s.prompts.push(createPrompt());s.updatedAt=nowISO();scheduleSave();renderWorkspace();toast('已增加一条提示词')}
@@ -1012,6 +1161,7 @@ ${copy}`;
       });
     });
     bindAllImageBoxes();
+    updateProjectEditMode();
     bindRealtimeInputs();
   }
 
@@ -1038,6 +1188,7 @@ ${copy}`;
   }
 
   function setActiveImageTarget(scope,ownerId,field,box){
+    if(cloudUser&&state.view==='workspace'&&!canEditProject(state.selectedProjectId))return;
     activeImageTarget={scope,ownerId,field};$$('.image-box').forEach(x=>x.classList.remove('active'));box.classList.add('active');
   }
   function getImageOwner(scope,ownerId){return scope==='project'?getProject(ownerId):findSection(ownerId)}
@@ -1056,15 +1207,18 @@ ${copy}`;
     if(gallery.length)openLightbox(gallery,index);
   }
   async function clearImages(scope,ownerId,field){
+    if(cloudUser&&state.view==='workspace'&&!canEditProject(state.selectedProjectId))return toast('当前项目无法编辑');
     const owner=getImageOwner(scope,ownerId);if(!owner)return;
     if(!confirm('确定清空这个区域的全部图片吗？'))return;
     owner[field]=[];await saveState();renderWorkspace();toast('图片已清空');
   }
   async function removeImage(scope,ownerId,field,imageId){
+    if(cloudUser&&state.view==='workspace'&&!canEditProject(state.selectedProjectId))return toast('当前项目无法编辑');
     const owner=getImageOwner(scope,ownerId);if(!owner)return;
     owner[field]=(owner[field]||[]).filter(img=>img.id!==imageId);await saveState();renderWorkspace();toast('图片已删除');
   }
   async function addImages(scope,ownerId,field,files){
+    if(cloudUser&&state.view==='workspace'&&!canEditProject(state.selectedProjectId))return toast('当前项目无法编辑');
     const owner=getImageOwner(scope,ownerId);if(!owner)return;
     toast('正在处理图片……');let compressed=0,failed=0;
     owner[field]=Array.isArray(owner[field])?owner[field]:[];
@@ -1229,10 +1383,11 @@ ${copy}`;
 
   document.addEventListener('paste',async e=>{
     if(!activeImageTarget||state.view!=='workspace')return;
+    if(cloudUser&&!canEditProject(state.selectedProjectId))return;
     const files=Array.from(e.clipboardData?.items||[]).filter(i=>i.type.startsWith('image/')).map(i=>i.getAsFile()).filter(Boolean);
     if(files.length){e.preventDefault();await addImages(activeImageTarget.scope,activeImageTarget.ownerId,activeImageTarget.field,files)}
   });
-  $('#navProjects').onclick=()=>{state.view='projects';scheduleSave();render()};
+  $('#navProjects').onclick=async()=>{await releaseProjectLock(state.selectedProjectId);state.view='projects';render()};
   $('#navCurrent').onclick=()=>{if(getProject()){state.view='workspace';scheduleSave();render()}else toast('暂无项目')};
   $('#sideAddProject').onclick=showProjectModal;
   $('#sideExport').onclick=exportData;
@@ -1252,7 +1407,7 @@ ${copy}`;
     if(lightboxOpen&&e.key==='ArrowRight'){e.preventDefault();moveLightbox(1)}
     if(e.key==='Escape'){closeLightbox();hideProjectModal()}
   });
-  window.addEventListener('beforeunload',()=>{sendRealtime({type:'editing:end'});if(saveTimer)saveState(false)});
+  window.addEventListener('beforeunload',()=>{releaseProjectLock(state?.selectedProjectId,true);sendRealtime({type:'editing:end'});if(saveTimer&&currentProjectLock?.canEdit)saveState(false)});
 
   loadState().then(()=>{render()});
 })();
